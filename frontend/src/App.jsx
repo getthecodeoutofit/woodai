@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Menu, Settings, History, MessageSquare, Brain, Workflow, Send, Plus, ChevronLeft, Moon, Sun, Trash2, User, Paperclip, Camera, X, Download, Copy, Check, Volume2, VolumeX, Maximize2, Minimize2, RefreshCw, Zap, FileText, Image as ImageIcon } from 'lucide-react';
+import { Menu, Settings, History, MessageSquare, Brain, Workflow, Send, Plus, ChevronLeft, Moon, Sun, Trash2, User, Paperclip, Camera, X, Download, Copy, Check, Volume2, VolumeX, Maximize2, Minimize2, RefreshCw, Zap, FileText, Image as ImageIcon, FolderOpen, Save } from 'lucide-react';
 
 export default function AIChat() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -19,6 +19,8 @@ export default function AIChat() {
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [temperature, setTemperature] = useState(0.7);
   const [isLoading, setIsLoading] = useState(false);
+  const [isUploadingDocument, setIsUploadingDocument] = useState(false);
+  const [uploadingFileName, setUploadingFileName] = useState('');
   const [attachedFiles, setAttachedFiles] = useState([]);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState(null);
@@ -31,6 +33,12 @@ export default function AIChat() {
   const [exportFormat, setExportFormat] = useState('txt');
   const [userId] = useState('default_user'); // Or get from auth
   const [currentChatId, setCurrentChatId] = useState(null);
+  const [documents, setDocuments] = useState([]);
+  const [selectedDocuments, setSelectedDocuments] = useState([]);
+  const [showDocuments, setShowDocuments] = useState(false);
+  const [showFileLocationDialog, setShowFileLocationDialog] = useState(false);
+  const [pendingMessage, setPendingMessage] = useState(null);
+  const [fileLocation, setFileLocation] = useState({ filename: '', directory: 'agent_outputs' });
   
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -48,6 +56,7 @@ export default function AIChat() {
   // Load chat history from backend
   useEffect(() => {
     loadChatHistory();
+    loadDocuments();
   }, []);
 
   // Estimate token count (rough approximation)
@@ -66,28 +75,83 @@ export default function AIChat() {
     calculateTokens();
   }, [messages, inputValue]);
 
-  const handleSend = async () => {
-    if (inputValue.trim() || attachedFiles.length > 0) {
+  // Detect if message contains file creation task
+  const isFileCreationTask = (message) => {
+    if (activeMode !== 'agent') return false;
+    const lower = message.toLowerCase();
+    const fileKeywords = ['create', 'write', 'make'].some(kw => lower.includes(kw));
+    const fileTypeKeywords = ['file', 'python', 'code', 'essay', 'text'].some(kw => lower.includes(kw));
+    return fileKeywords && fileTypeKeywords;
+  };
+
+  // Extract suggested filename from message
+  const extractSuggestedFilename = (message) => {
+    // Try to find filename in quotes or after "called" or "named"
+    const patterns = [
+      /(?:called|named)\s+['"]?([^\s'"]+\.(?:py|txt|md|js|html|css|json))['"]?/i,
+      /['"]([^\s'"]+\.(?:py|txt|md|js|html|css|json))['"]/i,
+      /(?:file|file\s+called)\s+['"]?([^\s'"]+\.(?:py|txt|md|js|html|css|json))['"]?/i,
+    ];
+    
+    for (const pattern of patterns) {
+      const match = message.match(pattern);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+    
+    // Default based on content type
+    if (message.toLowerCase().includes('python') || message.toLowerCase().includes('.py')) {
+      return 'code.py';
+    }
+    return 'output.txt';
+  };
+
+  const handleSend = async (customMessage = null, customFilePath = null) => {
+    const messageToSend = customMessage || inputValue;
+    
+    if (messageToSend.trim() || attachedFiles.length > 0) {
+      // Check if this is a file creation task and show dialog
+      if (isFileCreationTask(messageToSend) && !customFilePath && activeMode === 'agent') {
+        const suggestedFilename = extractSuggestedFilename(messageToSend);
+        setFileLocation({ filename: suggestedFilename, directory: 'agent_outputs' });
+        setPendingMessage(messageToSend);
+        setShowFileLocationDialog(true);
+        return;
+      }
+
       const userMessage = {
         role: 'user',
-        content: inputValue,
+        content: messageToSend,
         files: attachedFiles,
         timestamp: new Date().toLocaleTimeString()
       };
       
       setMessages(prev => [...prev, userMessage]);
-      setInputValue('');
-      setAttachedFiles([]);
+      if (!customMessage) {
+        setInputValue('');
+        setAttachedFiles([]);
+      }
       setIsLoading(true);
 
       try {
+        // Build file path if provided
+        let finalMessage = messageToSend;
+        if (customFilePath) {
+          const filePath = customFilePath.directory 
+            ? `${customFilePath.directory}/${customFilePath.filename}`
+            : customFilePath.filename;
+          // Append file path instruction to message
+          finalMessage = `${messageToSend} (save to: ${filePath})`;
+        }
+
         const response = await fetch('http://localhost:8000/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            message: userMessage.content,
+            message: finalMessage,
             mode: activeMode,
             context_length: contextLength,
             memory_enabled: memoryEnabled,
@@ -95,7 +159,8 @@ export default function AIChat() {
             system_prompt: systemPrompt,
             history: messages,
             user_id: userId,
-            chat_id: currentChatId // Include current chat ID
+            chat_id: currentChatId,
+            selected_doc_ids: selectedDocuments.length > 0 ? selectedDocuments : null
           })
         });
 
@@ -130,6 +195,21 @@ export default function AIChat() {
         setIsLoading(false);
       }
     }
+  };
+
+  const handleFileLocationConfirm = () => {
+    if (fileLocation.filename.trim()) {
+      setShowFileLocationDialog(false);
+      handleSend(pendingMessage, fileLocation);
+      setPendingMessage(null);
+      setFileLocation({ filename: '', directory: 'agent_outputs' });
+    }
+  };
+
+  const handleFileLocationCancel = () => {
+    setShowFileLocationDialog(false);
+    setPendingMessage(null);
+    setFileLocation({ filename: '', directory: 'agent_outputs' });
   };
 
   const handleFileSelect = (e) => {
@@ -179,6 +259,7 @@ export default function AIChat() {
       timestamp: new Date().toLocaleTimeString() 
     }]);
     setCurrentChatId(null);
+    setSelectedDocuments([]); // Clear selected documents for new chat
     setActiveView('chat');
   };
 
@@ -309,6 +390,21 @@ export default function AIChat() {
         setMessages(chat.messages);
         setActiveView('chat');
         setCurrentChatId(chatId);
+        
+        // Restore selected documents if they exist
+        if (chat.selected_doc_ids && chat.selected_doc_ids.length > 0) {
+          setSelectedDocuments(chat.selected_doc_ids);
+          // Only show restore message if chat has messages (not a new chat)
+          if (chat.messages && chat.messages.length > 1) {
+            setMessages(prev => [...prev, {
+              role: 'assistant',
+              content: `📚 Restored ${chat.selected_doc_ids.length} document${chat.selected_doc_ids.length > 1 ? 's' : ''} from this chat's context.`,
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+          }
+        } else {
+          setSelectedDocuments([]);
+        }
       }
     } catch (error) {
       console.error('Failed to load chat:', error);
@@ -339,8 +435,25 @@ export default function AIChat() {
     }
   };
 
+  // Load documents from backend
+  const loadDocuments = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/documents');
+      const data = await response.json();
+      
+      if (data.documents) {
+        setDocuments(data.documents);
+      }
+    } catch (error) {
+      console.error('Failed to load documents:', error);
+    }
+  };
+
   // Upload document
   const handleDocumentUpload = async (file) => {
+    setIsUploadingDocument(true);
+    setUploadingFileName(file.name);
+    
     try {
       const formData = new FormData();
       formData.append('file', file);
@@ -361,6 +474,9 @@ export default function AIChat() {
                    `- The AI can now use this document in RAG mode.`,
           timestamp: new Date().toLocaleTimeString()
         }]);
+        
+        // Reload documents list
+        loadDocuments();
       }
     } catch (error) {
       setMessages(prev => [...prev, {
@@ -368,7 +484,56 @@ export default function AIChat() {
         content: `❌ Failed to upload document: ${error.message}`,
         timestamp: new Date().toLocaleTimeString()
       }]);
+    } finally {
+      setIsUploadingDocument(false);
+      setUploadingFileName('');
     }
+  };
+
+  // Delete document
+  const deleteDocument = async (docId, filename) => {
+    if (!confirm(`Delete document "${filename}"? This will remove all its context from the knowledge base.`)) {
+      return;
+    }
+    
+    try {
+      const response = await fetch(`http://localhost:8000/document/${docId}`, {
+        method: 'DELETE'
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        // Remove from documents list
+        setDocuments(prev => prev.filter(doc => doc.doc_id !== docId));
+        
+        // Remove from selected documents if selected
+        setSelectedDocuments(prev => prev.filter(id => id !== docId));
+        
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `✅ Document "${filename}" deleted successfully!`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Failed to delete document: ${error.message}`,
+        timestamp: new Date().toLocaleTimeString()
+      }]);
+    }
+  };
+
+  // Toggle document selection
+  const toggleDocumentSelection = (docId) => {
+    setSelectedDocuments(prev => {
+      if (prev.includes(docId)) {
+        return prev.filter(id => id !== docId);
+      } else {
+        return [...prev, docId];
+      }
+    });
   };
 
   const filteredHistory = chatHistory.filter(chat => 
@@ -448,6 +613,7 @@ export default function AIChat() {
             {[
               { id: 'chat', icon: MessageSquare, label: 'Chat' },
               { id: 'history', icon: History, label: 'History' },
+              { id: 'documents', icon: FileText, label: 'Documents' },
               { id: 'settings', icon: Settings, label: 'Settings' }
             ].map(item => (
               <button
@@ -506,6 +672,76 @@ export default function AIChat() {
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* Documents Management */}
+          {activeView === 'documents' && (
+            <div className="flex-1 overflow-y-auto">
+              <p className={`text-xs font-semibold ${darkMode ? 'text-gray-400' : 'text-amber-800'} mb-3 uppercase tracking-wider`}>Uploaded Documents</p>
+              
+              {documents.length === 0 ? (
+                <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm text-center`}>
+                  <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
+                    No documents uploaded yet. Upload a PDF or document to get started.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {documents.map(doc => (
+                    <div
+                      key={doc.doc_id}
+                      className={`p-3 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm group relative`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedDocuments.includes(doc.doc_id)}
+                          onChange={() => toggleDocumentSelection(doc.doc_id)}
+                          className={`mt-1 w-4 h-4 rounded ${darkMode ? 'bg-gray-600 border-gray-500' : 'bg-white border-amber-300'} cursor-pointer`}
+                          title="Select to add context to chat"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className={`font-medium text-sm ${darkMode ? 'text-gray-200' : 'text-amber-900'} mb-1 truncate`}>
+                            {doc.filename}
+                          </div>
+                          <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
+                            {doc.chunk_count || 0} chunks • {new Date(doc.created_at).toLocaleDateString()}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => deleteDocument(doc.doc_id, doc.filename)}
+                          className={`p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity ${darkMode ? 'bg-red-600/20 hover:bg-red-600/30 text-red-400' : 'bg-red-600/20 hover:bg-red-600/30 text-red-600'}`}
+                          title="Delete document"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              
+              {selectedDocuments.length > 0 && (
+                <div className={`mt-4 p-3 rounded-lg ${darkMode ? 'bg-amber-600/20 border border-amber-600/30' : 'bg-amber-100/60 border border-amber-300/50'}`}>
+                  <p className={`text-xs font-semibold ${darkMode ? 'text-amber-400' : 'text-amber-800'} mb-2`}>
+                    {selectedDocuments.length} document{selectedDocuments.length > 1 ? 's' : ''} selected
+                  </p>
+                  <button
+                    onClick={() => {
+                      setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        content: `✅ Added ${selectedDocuments.length} document${selectedDocuments.length > 1 ? 's' : ''} to context. The AI will now use these documents when answering questions.`,
+                        timestamp: new Date().toLocaleTimeString()
+                      }]);
+                      setActiveView('chat');
+                    }}
+                    className={`w-full px-3 py-2 rounded-lg text-sm font-medium ${darkMode ? 'bg-amber-600/30 hover:bg-amber-600/40 text-amber-300' : 'bg-amber-600/80 hover:bg-amber-600/90 text-white'} transition-all`}
+                  >
+                    Use in Chat
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -699,6 +935,24 @@ export default function AIChat() {
           </div>
         </div>
 
+        {/* Selected Documents Indicator */}
+        {selectedDocuments.length > 0 && (
+          <div className={`${darkMode ? 'bg-amber-600/20 border-b border-amber-600/30' : 'bg-amber-100/60 border-b border-amber-300/50'} px-4 py-2 flex items-center justify-between`}>
+            <div className="flex items-center gap-2">
+              <FileText size={16} className={darkMode ? 'text-amber-400' : 'text-amber-800'} />
+              <span className={`text-sm font-medium ${darkMode ? 'text-amber-400' : 'text-amber-800'}`}>
+                {selectedDocuments.length} document{selectedDocuments.length > 1 ? 's' : ''} in context
+              </span>
+            </div>
+            <button
+              onClick={() => setSelectedDocuments([])}
+              className={`text-xs px-2 py-1 rounded ${darkMode ? 'hover:bg-amber-600/30 text-amber-400' : 'hover:bg-amber-200 text-amber-800'}`}
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-6 space-y-4">
           {messages.map((msg, idx) => (
@@ -786,6 +1040,48 @@ export default function AIChat() {
                   <div className={`w-2 h-2 rounded-full ${darkMode ? 'bg-amber-400' : 'bg-amber-900'} animate-bounce`} style={{animationDelay: '0ms'}} />
                   <div className={`w-2 h-2 rounded-full ${darkMode ? 'bg-amber-400' : 'bg-amber-900'} animate-bounce`} style={{animationDelay: '150ms'}} />
                   <div className={`w-2 h-2 rounded-full ${darkMode ? 'bg-amber-400' : 'bg-amber-900'} animate-bounce`} style={{animationDelay: '300ms'}} />
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {isUploadingDocument && (
+            <div className="flex gap-3 animate-[fadeIn_0.3s_ease-in]">
+              <div className={`w-10 h-10 rounded-xl ${darkMode ? 'bg-blue-600/30' : 'bg-blue-600/80'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
+                <FileText className={darkMode ? 'text-blue-400' : 'text-white'} size={20} />
+              </div>
+              <div className={`p-4 rounded-2xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm shadow-lg`}>
+                <div className="flex items-center gap-3">
+                  <RefreshCw className={`${darkMode ? 'text-blue-400' : 'text-blue-600'} animate-spin`} size={20} />
+                  <div>
+                    <div className={`text-sm font-medium ${darkMode ? 'text-gray-200' : 'text-gray-800'}`}>
+                      Processing document...
+                    </div>
+                    <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                      {uploadingFileName}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {isUploadingDocument && (
+            <div className="flex gap-3 animate-[fadeIn_0.3s_ease-in]">
+              <div className={`w-10 h-10 rounded-xl ${darkMode ? 'bg-blue-600/30' : 'bg-blue-600/80'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
+                <FileText className={darkMode ? 'text-blue-400' : 'text-white'} size={20} />
+              </div>
+              <div className={`p-4 rounded-2xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm shadow-lg`}>
+                <div className="flex items-center gap-3">
+                  <RefreshCw className={`${darkMode ? 'text-blue-400' : 'text-blue-600'} animate-spin`} size={20} />
+                  <div>
+                    <div className={`text-sm font-medium ${darkMode ? 'text-gray-200' : 'text-gray-800'}`}>
+                      Processing document...
+                    </div>
+                    <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                      {uploadingFileName}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -897,6 +1193,105 @@ export default function AIChat() {
         onChange={handleCameraCapture}
         className="hidden"
       />
+
+      {/* File Location Dialog */}
+      {showFileLocationDialog && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className={`${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4`}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className={`p-2 rounded-lg ${darkMode ? 'bg-amber-600/20' : 'bg-amber-100'}`}>
+                <FolderOpen className={darkMode ? 'text-amber-400' : 'text-amber-600'} size={24} />
+              </div>
+              <div>
+                <h3 className={`text-lg font-bold ${darkMode ? 'text-gray-100' : 'text-gray-900'}`}>
+                  Specify File Location
+                </h3>
+                <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                  Choose where to save the file
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  Filename
+                </label>
+                <input
+                  type="text"
+                  value={fileLocation.filename}
+                  onChange={(e) => setFileLocation(prev => ({ ...prev, filename: e.target.value }))}
+                  placeholder="e.g., calculator.py, notes.txt"
+                  className={`w-full px-4 py-2 rounded-lg border ${
+                    darkMode 
+                      ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' 
+                      : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
+                  } focus:outline-none focus:ring-2 focus:ring-amber-500`}
+                  autoFocus
+                />
+                <p className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-500'}`}>
+                  Include file extension (.py, .txt, .md, etc.)
+                </p>
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+                  Directory/Path
+                </label>
+                <input
+                  type="text"
+                  value={fileLocation.directory}
+                  onChange={(e) => setFileLocation(prev => ({ ...prev, directory: e.target.value }))}
+                  placeholder="e.g., agent_outputs, projects/myapp, /home/user/docs"
+                  className={`w-full px-4 py-2 rounded-lg border ${
+                    darkMode 
+                      ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' 
+                      : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
+                  } focus:outline-none focus:ring-2 focus:ring-amber-500`}
+                />
+                <p className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-gray-500'}`}>
+                  Relative to backend directory or absolute path. Default: agent_outputs
+                </p>
+              </div>
+
+              <div className={`p-3 rounded-lg ${darkMode ? 'bg-amber-600/10 border border-amber-600/30' : 'bg-amber-50 border border-amber-200'}`}>
+                <p className={`text-xs ${darkMode ? 'text-amber-300' : 'text-amber-800'}`}>
+                  <strong>Full path:</strong> {fileLocation.directory ? `${fileLocation.directory}/` : ''}{fileLocation.filename || 'filename'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-4">
+              <button
+                onClick={handleFileLocationCancel}
+                className={`flex-1 px-4 py-2 rounded-lg font-medium transition-all ${
+                  darkMode 
+                    ? 'bg-gray-700 hover:bg-gray-600 text-gray-200' 
+                    : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                }`}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleFileLocationConfirm}
+                disabled={!fileLocation.filename.trim()}
+                className={`flex-1 px-4 py-2 rounded-lg font-medium transition-all flex items-center justify-center gap-2 ${
+                  !fileLocation.filename.trim()
+                    ? darkMode 
+                      ? 'bg-gray-700 text-gray-500 cursor-not-allowed' 
+                      : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                    : darkMode 
+                      ? 'bg-amber-600 hover:bg-amber-700 text-white' 
+                      : 'bg-amber-600 hover:bg-amber-700 text-white'
+                }`}
+              >
+                <Save size={18} />
+                Create File
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <style jsx>{`
         @keyframes fadeIn {
