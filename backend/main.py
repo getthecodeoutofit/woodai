@@ -1,23 +1,25 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import uvicorn
 from rag_engine import RAGEngine
 from agent_engine import AgentEngine
+from database import get_database
 
 app = FastAPI(title="WoodAI Backend")
 
-# CORS middleware - Allow all origins for development
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize engines
+# Initialize engines and database
+db = get_database()
 rag_engine = RAGEngine()
 agent_engine = AgentEngine()
 
@@ -35,49 +37,166 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     system_prompt: str = "You are a helpful AI assistant."
     history: List[Message] = []
+    user_id: str = "default_user"
+    chat_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str
     mode: str
     tokens_used: Optional[int] = None
+    chat_id: Optional[str] = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize MongoDB connection on startup"""
+    db.connect()
+    print("🚀 WoodAI Backend started successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close MongoDB connection on shutdown"""
+    db.close()
+    print("👋 WoodAI Backend shut down")
 
 @app.get("/")
 async def root():
     return {
         "message": "WoodAI Backend is running", 
         "status": "healthy",
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "features": ["RAG", "Agent", "MongoDB", "OCR", "Multi-format documents"]
     }
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    """Main chat endpoint with MongoDB integration"""
     try:
+        # Generate response
         if request.mode == "rag":
-            # RAG mode using Ollama
             response = await rag_engine.generate_response(
                 message=request.message,
                 context_length=request.context_length,
                 memory_enabled=request.memory_enabled,
                 temperature=request.temperature,
                 system_prompt=request.system_prompt,
-                history=[msg.dict() for msg in request.history]
+                history=[msg.dict() for msg in request.history],
+                user_id=request.user_id
             )
         else:
-            # Agent mode
             response = await agent_engine.generate_response(
                 message=request.message,
                 system_prompt=request.system_prompt,
                 history=[msg.dict() for msg in request.history]
             )
         
+        # Save/update chat in MongoDB
+        chat_id = request.chat_id
+        updated_history = [msg.dict() for msg in request.history]
+        updated_history.append({
+            "role": "user",
+            "content": request.message,
+            "timestamp": ""
+        })
+        updated_history.append({
+            "role": "assistant", 
+            "content": response,
+            "timestamp": ""
+        })
+        
+        if chat_id:
+            # Update existing chat
+            await db.update_chat(chat_id, updated_history)
+        else:
+            # Create new chat
+            title = request.message[:50] + "..." if len(request.message) > 50 else request.message
+            chat_id = await db.save_chat(
+                user_id=request.user_id,
+                title=title,
+                messages=updated_history
+            )
+        
         return ChatResponse(
-            response=response, 
+            response=response,
             mode=request.mode,
-            tokens_used=len(response.split()) * 4  # Rough estimate
+            tokens_used=len(response.split()) * 4,
+            chat_id=chat_id
         )
     
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/chats/{user_id}")
+async def get_user_chats(user_id: str, limit: int = 50):
+    """Get all chats for a user"""
+    try:
+        chats = await db.get_user_chats(user_id, limit)
+        return {"chats": chats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/chat/{chat_id}")
+async def get_chat(chat_id: str):
+    """Get specific chat by ID"""
+    try:
+        chat = await db.get_chat_by_id(chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return chat
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/chat/{chat_id}")
+async def delete_chat(chat_id: str):
+    """Delete a chat"""
+    try:
+        success = await db.delete_chat(chat_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return {"success": True, "message": "Chat deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: str = Form("default_user")
+):
+    """Upload and index a document"""
+    try:
+        # Read file content
+        content = await file.read()
+        
+        # Process and index
+        result = await rag_engine.index_document(content, file.filename)
+        
+        if not result['success']:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Processing failed'))
+        
+        return {
+            "success": True,
+            "message": f"Document indexed successfully",
+            "doc_id": result['doc_id'],
+            "filename": result['filename'],
+            "chunks": result['chunks']
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/documents")
+async def get_documents():
+    """Get all indexed documents"""
+    try:
+        docs = await db.get_all_documents()
+        return {"documents": docs}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
@@ -85,10 +204,18 @@ async def health():
     rag_available = rag_engine.is_available()
     agent_available = agent_engine.is_available()
     
+    try:
+        # Check MongoDB
+        await db.chats.count_documents({}, limit=1)
+        db_connected = True
+    except:
+        db_connected = False
+    
     return {
         "status": "healthy",
         "rag_available": rag_available,
         "agent_available": agent_available,
+        "mongodb_connected": db_connected,
         "rag_model": rag_engine.model_name if rag_available else None,
         "knowledge_base_docs": len(rag_engine.knowledge_base)
     }

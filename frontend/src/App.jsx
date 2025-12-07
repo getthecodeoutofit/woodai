@@ -29,6 +29,8 @@ export default function AIChat() {
   const [searchQuery, setSearchQuery] = useState('');
   const [tokenCount, setTokenCount] = useState({ input: 0, output: 0, total: 0 });
   const [exportFormat, setExportFormat] = useState('txt');
+  const [userId] = useState('default_user'); // Or get from auth
+  const [currentChatId, setCurrentChatId] = useState(null);
   
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -42,6 +44,11 @@ export default function AIChat() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Load chat history from backend
+  useEffect(() => {
+    loadChatHistory();
+  }, []);
 
   // Estimate token count (rough approximation)
   useEffect(() => {
@@ -86,7 +93,9 @@ export default function AIChat() {
             memory_enabled: memoryEnabled,
             temperature: temperature,
             system_prompt: systemPrompt,
-            history: messages
+            history: messages,
+            user_id: userId,
+            chat_id: currentChatId // Include current chat ID
           })
         });
 
@@ -97,6 +106,14 @@ export default function AIChat() {
           content: data.response,
           timestamp: new Date().toLocaleTimeString()
         }]);
+        
+        // Update current chat ID if new chat was created
+        if (data.chat_id && !currentChatId) {
+          setCurrentChatId(data.chat_id);
+        }
+        
+        // Refresh chat history
+        loadChatHistory();
 
         // Text-to-speech if enabled
         if (voiceEnabled && 'speechSynthesis' in window) {
@@ -117,12 +134,26 @@ export default function AIChat() {
 
   const handleFileSelect = (e) => {
     const files = Array.from(e.target.files);
-    setAttachedFiles(prev => [...prev, ...files.map(f => ({ 
-      name: f.name, 
-      type: 'document', 
-      size: (f.size / 1024).toFixed(2) + ' KB',
-      file: f 
-    }))]);
+    
+    files.forEach(file => {
+      // Check if it's a document that should be indexed
+      const docExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.txt', '.csv'];
+      const fileExt = file.name.toLowerCase().substring(file.name.lastIndexOf('.'));
+      
+      if (docExtensions.includes(fileExt)) {
+        // Upload to backend for indexing
+        handleDocumentUpload(file);
+      } else {
+        // Just attach to message
+        setAttachedFiles(prev => [...prev, { 
+          name: file.name, 
+          type: 'document', 
+          size: (file.size / 1024).toFixed(2) + ' KB',
+          file: file 
+        }]);
+      }
+    });
+    
     setShowAttachMenu(false);
   };
 
@@ -142,15 +173,13 @@ export default function AIChat() {
   };
 
   const handleNewChat = () => {
-    const currentChat = {
-      id: Date.now(),
-      title: `Chat ${chatHistory.length + 1}`,
-      timestamp: 'Just now',
-      preview: messages[messages.length - 1]?.content.slice(0, 50) + '...' || 'New conversation',
-      messages: messages
-    };
-    setChatHistory(prev => [currentChat, ...prev]);
-    setMessages([{ role: 'assistant', content: 'Hello! I\'m your AI assistant. How can I help you today?', timestamp: new Date().toLocaleTimeString() }]);
+    setMessages([{ 
+      role: 'assistant', 
+      content: 'Hello! I\'m your AI assistant. How can I help you today?', 
+      timestamp: new Date().toLocaleTimeString() 
+    }]);
+    setCurrentChatId(null);
+    setActiveView('chat');
   };
 
   const copyToClipboard = (text, index) => {
@@ -250,10 +279,104 @@ export default function AIChat() {
     }
   };
 
+  // Load chat history from backend
+  const loadChatHistory = async () => {
+    try {
+      const response = await fetch(`http://localhost:8000/chats/${userId}`);
+      const data = await response.json();
+      
+      if (data.chats) {
+        setChatHistory(data.chats.map(chat => ({
+          id: chat._id,
+          title: chat.title,
+          timestamp: new Date(chat.updated_at).toLocaleDateString(),
+          preview: chat.preview,
+          messages: chat.messages
+        })));
+      }
+    } catch (error) {
+      console.error('Failed to load chat history:', error);
+    }
+  };
+
+  // Load specific chat when clicked
+  const loadChat = async (chatId) => {
+    try {
+      const response = await fetch(`http://localhost:8000/chat/${chatId}`);
+      const chat = await response.json();
+      
+      if (chat && chat.messages) {
+        setMessages(chat.messages);
+        setActiveView('chat');
+        setCurrentChatId(chatId);
+      }
+    } catch (error) {
+      console.error('Failed to load chat:', error);
+    }
+  };
+
+  // Delete chat
+  const deleteChat = async (chatId, e) => {
+    e.stopPropagation(); // Prevent click from triggering loadChat
+    
+    if (!confirm('Delete this chat?')) return;
+    
+    try {
+      const response = await fetch(`http://localhost:8000/chat/${chatId}`, {
+        method: 'DELETE'
+      });
+      
+      if (response.ok) {
+        setChatHistory(prev => prev.filter(chat => chat.id !== chatId));
+        
+        // If deleted chat is currently active, start new chat
+        if (currentChatId === chatId) {
+          handleNewChat();
+        }
+      }
+    } catch (error) {
+      console.error('Failed to delete chat:', error);
+    }
+  };
+
+  // Upload document
+  const handleDocumentUpload = async (file) => {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('user_id', userId);
+      
+      const response = await fetch('http://localhost:8000/upload', {
+        method: 'POST',
+        body: formData
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `✅ Document "${data.filename}" uploaded and indexed successfully!\n\n` +
+                   `- Chunks created: ${data.chunks}\n` +
+                   `- The AI can now use this document in RAG mode.`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Failed to upload document: ${error.message}`,
+        timestamp: new Date().toLocaleTimeString()
+      }]);
+    }
+  };
+
   const filteredHistory = chatHistory.filter(chat => 
     chat.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
     chat.preview.toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  
 
   return (
     <div 
@@ -359,11 +482,27 @@ export default function AIChat() {
                 {filteredHistory.map(chat => (
                   <div
                     key={chat.id}
-                    className={`p-3 rounded-lg ${darkMode ? 'bg-gray-700/40 hover:bg-gray-700/60' : 'bg-white/40 hover:bg-white/60'} cursor-pointer transition-all duration-200 backdrop-blur-sm`}
+                    onClick={() => loadChat(chat.id)}
+                    className={`p-3 rounded-lg ${darkMode ? 'bg-gray-700/40 hover:bg-gray-700/60' : 'bg-white/40 hover:bg-white/60'} cursor-pointer transition-all duration-200 backdrop-blur-sm group relative`}
                   >
-                    <div className={`font-medium text-sm ${darkMode ? 'text-gray-200' : 'text-amber-900'} mb-1`}>{chat.title}</div>
-                    <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'} mb-1 opacity-70`}>{chat.preview}</div>
-                    <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-amber-600'}`}>{chat.timestamp}</div>
+                    <div className={`font-medium text-sm ${darkMode ? 'text-gray-200' : 'text-amber-900'} mb-1`}>
+                      {chat.title}
+                    </div>
+                    <div className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'} mb-1 opacity-70`}>
+                      {chat.preview}
+                    </div>
+                    <div className={`text-xs ${darkMode ? 'text-gray-500' : 'text-amber-600'}`}>
+                      {chat.timestamp}
+                    </div>
+                    
+                    {/* Delete button */}
+                    <button
+                      onClick={(e) => deleteChat(chat.id, e)}
+                      className={`absolute top-2 right-2 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity ${darkMode ? 'bg-red-600/20 hover:bg-red-600/30 text-red-400' : 'bg-red-600/20 hover:bg-red-600/30 text-red-600'}`}
+                      title="Delete chat"
+                    >
+                      <Trash2 size={14} />
+                    </button>
                   </div>
                 ))}
               </div>
@@ -746,7 +885,7 @@ export default function AIChat() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".pdf,.doc,.docx,.txt"
+        accept=".pdf,.doc,.docx,.pptx,.xlsx,.txt,.csv"
         onChange={handleFileSelect}
         className="hidden"
       />
@@ -790,4 +929,5 @@ export default function AIChat() {
       `}</style>
     </div>
   );
+  
 }

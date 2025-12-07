@@ -4,6 +4,7 @@ from typing import List, Dict
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from pathlib import Path
+
 import time
 
 class RAGEngine:
