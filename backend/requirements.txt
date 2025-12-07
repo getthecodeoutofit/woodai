@@ -1,26 +1,143 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-sentence-transformers==2.2.2
-numpy==1.24.3
-requests==2.31.0
-pydantic==2.5.0
+# ============================================================================
+# WoodAI Backend - Requirements
+# Python 3.11+ recommended
+# Last Updated: 2024-12-07
+# ============================================================================
 
-# MongoDB
-pymongo==4.6.0
-motor==3.3.2
+# --- Core Scientific Computing ---
+numpy==1.26.4                    # Core numerical computing (compatible with PyTorch 2.2.x)
 
-# Document Processing
-PyPDF2==3.0.1
-python-docx==1.1.0
-python-pptx==0.6.23
-openpyxl==3.1.2
-pandas==2.1.4
+# --- Machine Learning & Deep Learning ---
+# PyTorch ecosystem (CPU/CUDA compatible)
+torch==2.2.1                     # PyTorch core
+torchvision==0.17.1              # Image processing for PyTorch
+transformers==4.38.2             # Hugging Face transformers (compatible with torch 2.2.x)
+sentence-transformers==2.5.1     # Sentence embeddings and semantic search
 
-# OCR
-pytesseract==0.3.10
-Pillow==10.1.0
-pdf2image==1.16.3
+# --- Web Framework & API ---
+fastapi==0.110.0                 # Modern async web framework
+uvicorn[standard]==0.27.1        # ASGI server with standard extras
+pydantic==2.6.3                  # Data validation (required by FastAPI 0.110+)
+python-multipart==0.0.6          # Required for FastAPI file uploads
 
-# Enhanced text extraction
-pdfplumber==0.10.3
-pypdf==3.17.4
+# --- HTTP & Networking ---
+requests==2.31.0                 # HTTP library for API calls (synchronous)
+httpx==0.27.0                    # Async HTTP client for faster agent mode (NEW)
+python-dotenv==1.0.0             # Load environment variables from .env file
+
+# --- Database ---
+pymongo==4.6.2                   # MongoDB driver (sync, includes bson)
+motor==3.3.2                     # MongoDB driver (async for FastAPI)
+
+# --- Document Processing ---
+# PDF processing (multiple strategies for 100% extraction)
+pypdf==4.1.0                     # Modern PDF library
+PyPDF2==3.0.1                    # Legacy PDF support (fallback)
+pdfplumber==0.10.4               # Advanced PDF extraction (tables, text)
+pymupdf==1.24.0                  # PyMuPDF (fitz) - excellent PDF extraction
+camelot-py[cv]==0.11.0           # Advanced table extraction from PDFs
+tabula-py==2.9.0                 # Table extraction from PDFs
+
+# Office documents
+python-docx==1.1.0               # Microsoft Word (.docx) processing
+python-pptx==0.6.23              # Microsoft PowerPoint (.pptx) processing
+openpyxl==3.1.2                  # Microsoft Excel (.xlsx) processing
+
+# Data processing
+pandas==2.2.1                    # Data manipulation (for Excel/CSV)
+
+# Natural Language Processing
+nltk==3.8.1                      # Natural language toolkit for tokenization and text processing
+rank-bm25==0.2.2                 # BM25 keyword search for hybrid retrieval
+scikit-learn==1.4.2              # For advanced text processing and clustering
+
+# --- Advanced Embedding Models ---
+# Note: These models will be loaded via sentence-transformers or HuggingFace
+# nomic-embed-text and mxbai-embed-large are available via sentence-transformers
+
+# --- LangChain & RAG Framework ---
+langchain==0.1.20                # LangChain core framework
+langchain-community==0.0.38      # Community integrations
+langchain-text-splitters==0.0.1  # Advanced text splitting
+langchain-core==0.1.52           # Core LangChain components
+langchain-chroma==0.1.3          # Chroma vector store integration (optional, fallback)
+unstructured[pdf,docx,xlsx,md]==0.12.4  # Advanced document parsing (HTML handled by beautifulsoup4)
+# detectron2             # For advanced document layout detection (optional)
+
+# --- Vector Database ---
+qdrant-client==1.7.0             # Qdrant - Modern, fast vector database (primary)
+chromadb==0.4.22                 # Chroma vector database (optional, fallback)
+onnxruntime==1.16.3             # Required by chromadb for default embeddings (can be avoided with custom embedding function)
+tiktoken==0.7.0                  # Token counting for chunk size management
+
+# --- Web Scraping ---
+beautifulsoup4==4.12.3           # HTML parsing for webpages
+lxml==5.1.0                      # XML/HTML parser
+html5lib==1.1                    # HTML5 parser
+
+# --- Code File Processing ---
+pygments==2.18.0                 # Syntax highlighting and code parsing
+
+# --- OCR & Image Processing ---
+Pillow==10.2.0                   # Image processing library
+pdf2image==1.17.0                # PDF to image conversion (for OCR)
+pytesseract==0.3.10              # OCR engine wrapper (fallback)
+easyocr==1.7.1                   # Advanced OCR with deep learning (better accuracy)
+opencv-python==4.9.0.80          # Computer vision for image preprocessing
+
+# Note: Tesseract OCR engine must be installed separately (fallback):
+#   Ubuntu/Debian: sudo apt-get install tesseract-ocr
+#   macOS: brew install tesseract
+#   Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+
+# ============================================================================
+# Optional Dependencies (for enhanced features)
+# ============================================================================
+
+# For better performance (optional)
+# accelerate==0.27.2              # Faster model loading
+# bitsandbytes==0.42.0            # Quantization support (if needed)
+
+# ============================================================================
+# Installation Notes:
+# ============================================================================
+# 1. Install PyTorch with CUDA support (if GPU available):
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# 2. For CPU-only installation, the versions above work fine.
+#
+# 3. Tesseract OCR must be installed separately (see above).
+#
+# 4. MongoDB must be running locally or provide connection string.
+#
+# 5. Qdrant runs locally - no separate server needed.
+#
+# 6. Install all dependencies:
+#    pip install -r requirements.txt
+#
+# 7. For faster agent mode, httpx is now included for async HTTP requests.
+#
+# ============================================================================
+# Environment Variables for GPU Memory Management:
+# ============================================================================
+# If you encounter CUDA out of memory errors during OCR:
+#
+# Option 1: Force OCR to use CPU (recommended if GPU memory is limited):
+#    export FORCE_CPU_OCR=true
+#
+# Option 2: Reduce PyTorch memory fragmentation:
+#    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#
+# Option 3: Force all operations to use CPU:
+#    export FORCE_CPU=true
+#
+# Note: FORCE_CPU_OCR only affects OCR operations, while FORCE_CPU affects
+#       all GPU operations (embeddings, OCR, etc.)
+#
+# ============================================================================
+# Recent Updates:
+# ============================================================================
+# - Added httpx==0.27.0 for async HTTP (faster agent mode)
+# - All packages verified and up to date
+# - Compatible with Python 3.11+
+# ============================================================================

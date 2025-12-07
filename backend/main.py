@@ -3,9 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import uvicorn
+from dotenv import load_dotenv
 from rag_engine import RAGEngine
 from agent_engine import AgentEngine
 from database import get_database
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = FastAPI(title="WoodAI Backend")
 
@@ -39,6 +43,7 @@ class ChatRequest(BaseModel):
     history: List[Message] = []
     user_id: str = "default_user"
     chat_id: Optional[str] = None
+    selected_doc_ids: Optional[List[str]] = None
 
 class ChatResponse(BaseModel):
     response: str
@@ -80,14 +85,20 @@ async def chat(request: ChatRequest):
                 temperature=request.temperature,
                 system_prompt=request.system_prompt,
                 history=[msg.dict() for msg in request.history],
-                user_id=request.user_id
+                filter_doc_ids=request.selected_doc_ids
             )
         else:
+            # Agent mode - ensure we get a string response (not structured)
             response = await agent_engine.generate_response(
                 message=request.message,
                 system_prompt=request.system_prompt,
-                history=[msg.dict() for msg in request.history]
+                history=[msg.dict() for msg in request.history],
+                return_structured=False  # Explicitly request string response
             )
+            # Ensure response is a string (in case of any edge cases)
+            if isinstance(response, dict):
+                response = response.get('response', str(response))
+            response = str(response)
         
         # Save/update chat in MongoDB
         chat_id = request.chat_id
@@ -105,14 +116,15 @@ async def chat(request: ChatRequest):
         
         if chat_id:
             # Update existing chat
-            await db.update_chat(chat_id, updated_history)
+            await db.update_chat(chat_id, updated_history, request.selected_doc_ids)
         else:
             # Create new chat
             title = request.message[:50] + "..." if len(request.message) > 50 else request.message
             chat_id = await db.save_chat(
                 user_id=request.user_id,
                 title=title,
-                messages=updated_history
+                messages=updated_history,
+                selected_doc_ids=request.selected_doc_ids
             )
         
         return ChatResponse(
@@ -196,6 +208,30 @@ async def get_documents():
     try:
         docs = await db.get_all_documents()
         return {"documents": docs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/document/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete a document and all its vectors"""
+    try:
+        # Delete from vector store (Qdrant)
+        if rag_engine.vector_store:
+            success = rag_engine.vector_store.delete_documents([doc_id])
+            if not success:
+                print(f"⚠️ Warning: Failed to delete vectors for doc_id: {doc_id}")
+        
+        # Delete document metadata from MongoDB
+        success = await db.delete_document(doc_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        return {
+            "success": True,
+            "message": f"Document {doc_id} deleted successfully"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
