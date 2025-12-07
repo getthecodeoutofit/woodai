@@ -32,7 +32,67 @@ except ImportError:
     print("⚠️ Qdrant not available. Install with: pip install qdrant-client")
 
 
-def cleanup_stale_qdrant_lock(qdrant_path: str, max_age_seconds: int = 300) -> bool:
+def cleanup_qdrant_lock(qdrant_path: str, force: bool = False, max_age_seconds: int = 180) -> bool:
+    """
+    Clean up Qdrant lock file
+    
+    Args:
+        qdrant_path: Path to Qdrant database directory
+        force: If True, remove lock file regardless of age (use with caution)
+        max_age_seconds: Maximum age of lock file before considering it stale (default: 5 minutes)
+    
+    Returns:
+        True if lock was cleaned up, False otherwise
+    """
+    try:
+        qdrant_path_obj = Path(qdrant_path)
+        # Check for lock file in the directory
+        lock_file = qdrant_path_obj / ".lock"
+        
+        # Also check in collection subdirectories (some Qdrant versions store locks there)
+        collection_lock_files = list(qdrant_path_obj.glob("**/.lock"))
+        
+        all_lock_files = [lock_file] if lock_file.exists() else []
+        all_lock_files.extend(collection_lock_files)
+        
+        cleaned = False
+        for lock_file_path in all_lock_files:
+            if lock_file_path.exists():
+                try:
+                    lock_age = time.time() - lock_file_path.stat().st_mtime
+                    if force or lock_age > max_age_seconds:
+                        if force:
+                            print(f"🧹 Force removing Qdrant lock: {lock_file_path}")
+                        else:
+                            print(f"🧹 Removing stale Qdrant lock: {lock_file_path} (age: {lock_age:.0f}s)")
+                        lock_file_path.unlink()
+                        cleaned = True
+                    else:
+                        print(f"⚠️ Lock file exists but is recent (age: {lock_age:.0f}s). Use force=True to remove.")
+                except (OSError, PermissionError) as e:
+                    print(f"⚠️ Could not remove lock file {lock_file_path}: {e}")
+                except Exception as e:
+                    print(f"⚠️ Error checking lock file {lock_file_path}: {e}")
+        
+        return cleaned
+    except Exception as e:
+        print(f"⚠️ Error in cleanup_qdrant_lock: {e}")
+        return False
+
+
+def cleanup_stale_qdrant_lock(qdrant_path: str, max_age_seconds: int = 180) -> bool:
+    """
+    Clean up stale Qdrant lock file if it's older than max_age_seconds
+    (Legacy function - use cleanup_qdrant_lock for more options)
+    
+    Args:
+        qdrant_path: Path to Qdrant database directory
+        max_age_seconds: Maximum age of lock file before considering it stale (default: 5 minutes)
+    
+    Returns:
+        True if lock was cleaned up, False otherwise
+    """
+    return cleanup_qdrant_lock(qdrant_path, force=False, max_age_seconds=max_age_seconds)
     """
     Clean up stale Qdrant lock file if it's older than max_age_seconds
     
@@ -44,16 +104,46 @@ def cleanup_stale_qdrant_lock(qdrant_path: str, max_age_seconds: int = 300) -> b
         True if lock was cleaned up, False otherwise
     """
     try:
-        lock_file = Path(qdrant_path) / ".lock"
-        if lock_file.exists():
-            lock_age = time.time() - lock_file.stat().st_mtime
-            if lock_age > max_age_seconds:
-                print(f"🧹 Removing stale Qdrant lock (age: {lock_age:.0f}s)")
-                lock_file.unlink()
-                return True
-        return False
+        qdrant_path_obj = Path(qdrant_path)
+        # Check for lock file in the directory
+        lock_file = qdrant_path_obj / ".lock"
+        
+        # Also check in collection subdirectories (some Qdrant versions store locks there)
+        collection_lock_files = list(qdrant_path_obj.glob("**/.lock"))
+        
+        all_lock_files = [lock_file] if lock_file.exists() else []
+        all_lock_files.extend(collection_lock_files)
+        
+        cleaned = False
+        for lock_file_path in all_lock_files:
+            if lock_file_path.exists():
+                try:
+                    lock_age = time.time() - lock_file_path.stat().st_mtime
+                    if lock_age > max_age_seconds:
+                        print(f"🧹 Removing stale Qdrant lock: {lock_file_path} (age: {lock_age:.0f}s)")
+                        lock_file_path.unlink()
+                        cleaned = True
+                except (OSError, PermissionError) as e:
+                    print(f"⚠️ Could not remove lock file {lock_file_path}: {e}")
+                    # Try to check if process is still running
+                    try:
+                        import psutil
+                        # Check if any process is using the lock file
+                        for proc in psutil.process_iter(['pid', 'name']):
+                            try:
+                                if 'qdrant' in proc.info['name'].lower() or 'python' in proc.info['name'].lower():
+                                    # Process might be holding the lock
+                                    pass
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                    except ImportError:
+                        pass  # psutil not available
+                except Exception as e:
+                    print(f"⚠️ Error checking lock file {lock_file_path}: {e}")
+        
+        return cleaned
     except Exception as e:
-        print(f"⚠️ Error checking lock file: {e}")
+        print(f"⚠️ Error in cleanup_stale_qdrant_lock: {e}")
         return False
 
 
@@ -84,16 +174,30 @@ class QdrantVectorStore:
             self.path.mkdir(parents=True, exist_ok=True)
             
             # Try to initialize with local storage
-            # First check if lock exists
+            # First check if lock exists and clean up stale locks
             lock_file = self.path / ".lock"
+            # Use environment variable or default to 180 seconds (3 minutes) for stale lock threshold
+            stale_lock_threshold = int(os.getenv('QDRANT_STALE_LOCK_SECONDS', '180'))
+            
             if lock_file.exists():
                 lock_age = time.time() - lock_file.stat().st_mtime
-                if lock_age > 300:  # 5 minutes - stale, clean it up
+                if lock_age > stale_lock_threshold:  # Stale lock - clean it up
                     print(f"🧹 Found stale lock (age: {lock_age:.0f}s), cleaning up...")
-                    cleanup_stale_qdrant_lock(str(self.path))
+                    if cleanup_qdrant_lock(str(self.path), force=False, max_age_seconds=stale_lock_threshold):
+                        # Lock was cleaned, continue with initialization
+                        print("   Lock cleaned, retrying initialization...")
+                    else:
+                        # Could not clean lock, use fallback if enabled
+                        if use_memory_fallback:
+                            print("   Could not clean lock, using in-memory mode")
+                            self.client = QdrantClient(":memory:")
+                            self.use_memory = True
+                            self._ensure_collection()
+                            return
                 elif use_memory_fallback:  # Recent lock - use fallback immediately
                     print(f"⚠️ Qdrant database is locked (lock age: {lock_age:.0f}s)")
                     print("   Using in-memory mode to avoid conflicts")
+                    print(f"   (Lock will be cleaned automatically if older than {stale_lock_threshold}s)")
                     self.client = QdrantClient(":memory:")
                     self.use_memory = True
                     self._ensure_collection()
@@ -175,15 +279,41 @@ class QdrantVectorStore:
                     )
                 )
                 print(f"✅ Created Qdrant collection: {self.collection_name}")
+                print(f"   Collection is empty - ready for document indexing")
             else:
                 # Verify collection configuration
                 collection_info = self.client.get_collection(self.collection_name)
-                if collection_info.config.params.vectors.size != self.embedding_dim:
-                    print(f"⚠️ Collection dimension mismatch. Recreating...")
+                existing_dim = collection_info.config.params.vectors.size
+                points_count = collection_info.points_count
+                
+                if existing_dim != self.embedding_dim:
+                    print(f"⚠️ Collection dimension mismatch detected!")
+                    print(f"   Existing collection: {existing_dim}D, Required: {self.embedding_dim}D")
+                    print(f"   Collection has {points_count} indexed documents")
+                    
+                    if points_count > 0:
+                        print(f"⚠️ WARNING: Dimension mismatch with {points_count} existing documents!")
+                        print(f"   This usually happens when the embedding model changed.")
+                        print(f"   To preserve data: Use the same embedding model or manually delete qdrant_db/")
+                        print(f"   To recreate: Delete backend/qdrant_db/ directory and restart")
+                        raise RuntimeError(
+                            f"Collection dimension mismatch ({existing_dim}D vs {self.embedding_dim}D) with {points_count} existing documents. "
+                            f"To fix: Use the same embedding model, or delete backend/qdrant_db/ to recreate collection."
+                        )
+                    
+                    print(f"   Deleting and recreating empty collection...")
                     self.client.delete_collection(self.collection_name)
                     self._ensure_collection()
                 else:
                     print(f"✅ Using existing Qdrant collection: {self.collection_name}")
+                    print(f"   📊 Collection statistics:")
+                    print(f"      - Vector dimension: {existing_dim}D")
+                    print(f"      - Indexed documents (points): {points_count}")
+                    
+                    if points_count > 0:
+                        print(f"   ✅ {points_count} document chunks are available for RAG queries")
+                    else:
+                        print(f"   ⚠️ Collection is empty - no documents indexed yet")
         except Exception as e:
             print(f"❌ Error ensuring collection: {e}")
             raise
@@ -347,28 +477,37 @@ class QdrantVectorStore:
                 qdrant_filter = Filter(must=conditions)
         
         try:
-            # Search in Qdrant - try multiple API methods for compatibility
+            # Search in Qdrant - use query_points() method (qdrant-client 1.16.1+)
+            # For older versions, try fallback methods
             search_results = None
             error_messages = []
             
-            # Method 1: Standard search() method (qdrant-client 1.7.0+)
+            # Method 1: query_points() method (qdrant-client 1.16.1+)
             try:
-                search_params = {
+                query_params = {
                     "collection_name": self.collection_name,
-                    "query_vector": query_vector,
+                    "query": query_vector,  # Can be list of floats or numpy array
                     "limit": top_k,
                     "with_payload": True,
                     "with_vectors": False
                 }
                 if score_threshold is not None:
-                    search_params["score_threshold"] = score_threshold
+                    query_params["score_threshold"] = score_threshold
                 if qdrant_filter is not None:
-                    search_params["query_filter"] = qdrant_filter
+                    query_params["query_filter"] = qdrant_filter
                 
-                search_results = self.client.search(**search_params)
+                response = self.client.query_points(**query_params)
+                # Extract points from QueryResponse
+                if hasattr(response, 'points'):
+                    search_results = response.points
+                elif hasattr(response, 'result'):
+                    search_results = response.result
+                else:
+                    # Try to iterate directly
+                    search_results = list(response) if response else []
             except AttributeError as e1:
-                error_messages.append(f"Method 'search' failed: {e1}")
-                # Method 2: Try search_points (older API)
+                error_messages.append(f"Method 'query_points' failed: {e1}")
+                # Method 2: Try search() method (qdrant-client 1.7.0-1.15.x)
                 try:
                     search_params = {
                         "collection_name": self.collection_name,
@@ -382,26 +521,30 @@ class QdrantVectorStore:
                     if qdrant_filter is not None:
                         search_params["query_filter"] = qdrant_filter
                     
-                    search_results = self.client.search_points(**search_params)
+                    search_results = self.client.search(**search_params)
                 except AttributeError as e2:
-                    error_messages.append(f"Method 'search_points' failed: {e2}")
-                    # Method 3: Try collection-based search
+                    error_messages.append(f"Method 'search' failed: {e2}")
+                    # Method 3: Try search_points (very old API)
                     try:
-                        collection = self.client.get_collection(self.collection_name)
-                        search_results = collection.search(
-                            query_vector=query_vector,
-                            limit=top_k,
-                            score_threshold=score_threshold,
-                            query_filter=qdrant_filter,
-                            with_payload=True,
-                            with_vectors=False
-                        )
-                    except (AttributeError, Exception) as e3:
-                        error_messages.append(f"Collection-based search failed: {e3}")
+                        search_params = {
+                            "collection_name": self.collection_name,
+                            "query_vector": query_vector,
+                            "limit": top_k,
+                            "with_payload": True,
+                            "with_vectors": False
+                        }
+                        if score_threshold is not None:
+                            search_params["score_threshold"] = score_threshold
+                        if qdrant_filter is not None:
+                            search_params["query_filter"] = qdrant_filter
+                        
+                        search_results = self.client.search_points(**search_params)
+                    except AttributeError as e3:
+                        error_messages.append(f"Method 'search_points' failed: {e3}")
                         raise RuntimeError(
                             f"All Qdrant search methods failed. Errors: {'; '.join(error_messages)}\n"
-                            f"Available methods: {[m for m in dir(self.client) if 'search' in m.lower()]}\n"
-                            f"Qdrant client version: {getattr(self.client, '__version__', 'unknown')}\n"
+                            f"Available query methods: {[m for m in dir(self.client) if 'query' in m.lower() or 'search' in m.lower()]}\n"
+                            f"Qdrant client type: {type(self.client).__name__}\n"
                             f"Please check qdrant-client version compatibility."
                         )
             except Exception as e:
@@ -414,23 +557,39 @@ class QdrantVectorStore:
             if search_results is None:
                 raise RuntimeError("Search returned None - no results and no error")
             
-            # Format results
+            # Format results - handle both QueryResponse.points and direct list of ScoredPoint
             results = []
             for result in search_results:
-                payload = result.payload
+                # Handle different response formats
+                if hasattr(result, 'payload'):
+                    payload = result.payload
+                    score = float(result.score) if hasattr(result, 'score') else 0.0
+                    point_id = str(result.id) if hasattr(result, 'id') else ''
+                elif hasattr(result, 'point'):
+                    # QueryResponse format
+                    payload = result.point.payload if hasattr(result.point, 'payload') else {}
+                    score = float(result.score) if hasattr(result, 'score') else 0.0
+                    point_id = str(result.point.id) if hasattr(result.point, 'id') else ''
+                else:
+                    # Fallback
+                    payload = getattr(result, 'payload', {})
+                    score = float(getattr(result, 'score', 0.0))
+                    point_id = str(getattr(result, 'id', ''))
+                
                 results.append({
-                    'text': payload.get('text', ''),
-                    'similarity': float(result.score),  # Qdrant returns similarity score
-                    'doc_id': payload.get('doc_id', ''),
-                    'chunk_index': payload.get('chunk_index', 0),
+                    'text': payload.get('text', '') if isinstance(payload, dict) else '',
+                    'similarity': score,
+                    'doc_id': payload.get('doc_id', '') if isinstance(payload, dict) else '',
+                    'chunk_index': payload.get('chunk_index', 0) if isinstance(payload, dict) else 0,
                     'metadata': {
-                        'source': payload.get('source', 'unknown'),
-                        'page': payload.get('page', ''),
-                        'section': payload.get('section', ''),
-                        'type': payload.get('type', 'unknown'),
-                        **{k: v for k, v in payload.items() if k not in ['text', 'doc_id', 'chunk_index', 'source', 'page', 'section', 'type']}
+                        'source': payload.get('source', 'unknown') if isinstance(payload, dict) else 'unknown',
+                        'page': payload.get('page', '') if isinstance(payload, dict) else '',
+                        'section': payload.get('section', '') if isinstance(payload, dict) else '',
+                        'type': payload.get('type', 'unknown') if isinstance(payload, dict) else 'unknown',
+                        **{k: v for k, v in (payload.items() if isinstance(payload, dict) else []) 
+                           if k not in ['text', 'doc_id', 'chunk_index', 'source', 'page', 'section', 'type']}
                     },
-                    'id': str(result.id)
+                    'id': point_id
                 })
             
             return results
@@ -480,7 +639,8 @@ class QdrantVectorStore:
         query_text: str,
         top_k: int = 5,
         semantic_weight: float = 0.7,
-        keyword_weight: float = 0.3
+        keyword_weight: float = 0.3,
+        filter_conditions: Optional[Dict] = None
     ) -> List[Dict]:
         """
         Hybrid search combining semantic and keyword matching
@@ -491,27 +651,89 @@ class QdrantVectorStore:
             top_k: Number of results to return
             semantic_weight: Weight for semantic similarity (0-1)
             keyword_weight: Weight for keyword matching (0-1)
+            filter_conditions: Optional filter conditions (e.g., {"doc_id": ["id1", "id2"]})
         
         Returns:
             Combined and re-ranked results
         """
-        # Semantic search
-        semantic_results = self.search(query_embedding, top_k=top_k * 2)
+        # Semantic search with filter
+        semantic_results = self.search(
+            query_embedding, 
+            top_k=top_k * 2,
+            filter_conditions=filter_conditions
+        )
         
         # Keyword search (simple text matching in payload)
         keyword_results = []
         try:
-            # Get all documents and score by keyword matches
-            scroll_results = self.client.scroll(
-                collection_name=self.collection_name,
-                limit=1000,  # Adjust based on collection size
-                with_payload=True,
-                with_vectors=False
-            )
+            # Build filter for scroll if filter_conditions provided
+            qdrant_filter = None
+            if filter_conditions:
+                conditions = []
+                for key, value in filter_conditions.items():
+                    if isinstance(value, list):
+                        if len(value) == 1:
+                            conditions.append(
+                                FieldCondition(
+                                    key=key,
+                                    match=MatchValue(value=value[0])
+                                )
+                            )
+                        elif len(value) > 1:
+                            if MATCH_ANY_AVAILABLE and MatchAny:
+                                conditions.append(
+                                    FieldCondition(
+                                        key=key,
+                                        match=MatchAny(any=value)
+                                    )
+                                )
+                            else:
+                                # Fallback: use first value, will filter after
+                                conditions.append(
+                                    FieldCondition(
+                                        key=key,
+                                        match=MatchValue(value=value[0])
+                                    )
+                                )
+                    else:
+                        conditions.append(
+                            FieldCondition(
+                                key=key,
+                                match=MatchValue(value=value)
+                            )
+                        )
+                if conditions:
+                    qdrant_filter = Filter(must=conditions)
+            
+            # Get documents with filter applied
+            scroll_params = {
+                "collection_name": self.collection_name,
+                "limit": 1000,  # Adjust based on collection size
+                "with_payload": True,
+                "with_vectors": False
+            }
+            if qdrant_filter:
+                scroll_params["query_filter"] = qdrant_filter
+            
+            scroll_results = self.client.scroll(**scroll_params)
             
             query_words = set(query_text.lower().split())
             for point in scroll_results[0]:
                 payload = point.payload
+                
+                # Apply post-filter if MatchAny not available and we have multiple doc_ids
+                if filter_conditions:
+                    doc_id = payload.get('doc_id', '')
+                    filter_doc_ids = filter_conditions.get('doc_id', [])
+                    if isinstance(filter_doc_ids, list) and len(filter_doc_ids) > 1:
+                        if not (MATCH_ANY_AVAILABLE and MatchAny):
+                            # Post-filter if MatchAny not available
+                            if doc_id not in filter_doc_ids:
+                                continue
+                    elif isinstance(filter_doc_ids, list) and len(filter_doc_ids) == 1:
+                        if doc_id != filter_doc_ids[0]:
+                            continue
+                
                 text = payload.get('text', '').lower()
                 text_words = set(text.split())
                 
@@ -618,15 +840,38 @@ class QdrantVectorStore:
         """Get collection statistics"""
         try:
             collection_info = self.client.get_collection(self.collection_name)
-            return {
+            info = {
                 'name': self.collection_name,
                 'points_count': collection_info.points_count,
-                'vectors_count': collection_info.vectors_count,
-                'indexed_vectors_count': collection_info.indexed_vectors_count,
+                'indexed_vectors_count': getattr(collection_info, 'indexed_vectors_count', collection_info.points_count),
                 'status': collection_info.status.value if hasattr(collection_info.status, 'value') else str(collection_info.status)
             }
+            # Try to get vectors_count if available (older Qdrant versions)
+            if hasattr(collection_info, 'vectors_count'):
+                info['vectors_count'] = collection_info.vectors_count
+            else:
+                # In newer versions, vectors_count == points_count
+                info['vectors_count'] = collection_info.points_count
+            return info
+        except AttributeError as e:
+            # Handle missing attributes gracefully
+            print(f"⚠️ CollectionInfo missing attribute: {e}")
+            try:
+                collection_info = self.client.get_collection(self.collection_name)
+                return {
+                    'name': self.collection_name,
+                    'points_count': getattr(collection_info, 'points_count', 0),
+                    'vectors_count': getattr(collection_info, 'points_count', 0),
+                    'indexed_vectors_count': getattr(collection_info, 'indexed_vectors_count', 0),
+                    'status': 'unknown'
+                }
+            except Exception as e2:
+                print(f"❌ Error getting collection info: {e2}")
+                return {}
         except Exception as e:
             print(f"❌ Error getting collection info: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
     
     def clear_collection(self) -> bool:

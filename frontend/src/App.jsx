@@ -39,11 +39,18 @@ export default function AIChat() {
   const [showFileLocationDialog, setShowFileLocationDialog] = useState(false);
   const [pendingMessage, setPendingMessage] = useState(null);
   const [fileLocation, setFileLocation] = useState({ filename: '', directory: 'agent_outputs' });
+  const [currentRagModel, setCurrentRagModel] = useState('gemma3:4b');
+  const [currentAgentModel, setCurrentAgentModel] = useState('gemma3:4b');
+  const [availableModels, setAvailableModels] = useState([]);
+  const [showModelSelector, setShowModelSelector] = useState(false);
+  const [downloadingModel, setDownloadingModel] = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState('');
   
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const cameraInputRef = useRef(null);
   const chatContainerRef = useRef(null);
+  const streamingMessageRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -57,7 +64,133 @@ export default function AIChat() {
   useEffect(() => {
     loadChatHistory();
     loadDocuments();
+    loadModels();
   }, []);
+
+  // Load models from backend
+  const loadModels = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/models');
+      const data = await response.json();
+      
+      if (data.rag_model) {
+        setCurrentRagModel(data.rag_model);
+      }
+      if (data.agent_model) {
+        setCurrentAgentModel(data.agent_model);
+      }
+      if (data.available_models) {
+        setAvailableModels(data.available_models);
+      }
+    } catch (error) {
+      console.error('Failed to load models:', error);
+    }
+  };
+
+  // Switch model
+  const switchModel = async (modelName, mode) => {
+    try {
+      const response = await fetch('http://localhost:8000/models/switch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model_name: modelName,
+          mode: mode
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        if (mode === 'rag') {
+          setCurrentRagModel(modelName);
+        } else {
+          setCurrentAgentModel(modelName);
+        }
+        
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `✅ Switched ${mode} model to ${modelName}`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+        
+        // Reload models to update available list
+        loadModels();
+      } else {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `❌ Failed to switch model: ${data.detail || 'Unknown error'}`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Error switching model: ${error.message}`,
+        timestamp: new Date().toLocaleTimeString()
+      }]);
+    }
+  };
+
+  // Download model
+  const downloadModel = async (modelName) => {
+    setDownloadingModel(modelName);
+    setDownloadProgress('Starting download...');
+    
+    try {
+      const response = await fetch('http://localhost:8000/models/download', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model_name: modelName
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        setDownloadProgress('Download completed!');
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `✅ Model ${modelName} downloaded successfully!`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+        
+        // Reload models to update available list
+        setTimeout(() => {
+          loadModels();
+          setDownloadingModel(null);
+          setDownloadProgress('');
+        }, 1000);
+      } else {
+        setDownloadProgress(`Error: ${data.error || 'Download failed'}`);
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `❌ Failed to download model: ${data.error || 'Unknown error'}`,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+        setTimeout(() => {
+          setDownloadingModel(null);
+          setDownloadProgress('');
+        }, 3000);
+      }
+    } catch (error) {
+      setDownloadProgress(`Error: ${error.message}`);
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Error downloading model: ${error.message}`,
+        timestamp: new Date().toLocaleTimeString()
+      }]);
+      setTimeout(() => {
+        setDownloadingModel(null);
+        setDownloadProgress('');
+      }, 3000);
+    }
+  };
 
   // Estimate token count (rough approximation)
   useEffect(() => {
@@ -145,7 +278,21 @@ export default function AIChat() {
           finalMessage = `${messageToSend} (save to: ${filePath})`;
         }
 
-        const response = await fetch('http://localhost:8000/chat', {
+        // Add placeholder assistant message for streaming
+        let assistantMessageIndex;
+        setMessages(prev => {
+          assistantMessageIndex = prev.length; // Index after user message
+          return [...prev, {
+            role: 'assistant',
+            content: '',
+            timestamp: new Date().toLocaleTimeString()
+          }];
+        });
+
+        // Use streaming endpoint
+        // Get updated messages after adding user and assistant messages
+        const updatedMessages = [...messages, userMessage];
+        const response = await fetch('http://localhost:8000/chat/stream', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -157,40 +304,110 @@ export default function AIChat() {
             memory_enabled: memoryEnabled,
             temperature: temperature,
             system_prompt: systemPrompt,
-            history: messages,
+            history: updatedMessages,
             user_id: userId,
             chat_id: currentChatId,
             selected_doc_ids: selectedDocuments.length > 0 ? selectedDocuments : null
           })
         });
 
-        const data = await response.json();
-        
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: data.response,
-          timestamp: new Date().toLocaleTimeString()
-        }]);
-        
-        // Update current chat ID if new chat was created
-        if (data.chat_id && !currentChatId) {
-          setCurrentChatId(data.chat_id);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
         }
-        
-        // Refresh chat history
-        loadChatHistory();
 
-        // Text-to-speech if enabled
-        if (voiceEnabled && 'speechSynthesis' in window) {
-          const utterance = new SpeechSynthesisUtterance(data.response);
-          window.speechSynthesis.speak(utterance);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullResponse = '';
+        streamingMessageRef.current = { index: assistantMessageIndex, content: '' };
+
+        // Function to update message immediately
+        const updateMessage = (content) => {
+          setMessages(prev => {
+            const updated = [...prev];
+            if (assistantMessageIndex !== undefined && updated[assistantMessageIndex]) {
+              updated[assistantMessageIndex] = {
+                ...updated[assistantMessageIndex],
+                content: content
+              };
+            }
+            return updated;
+          });
+          // Force scroll to bottom
+          setTimeout(() => scrollToBottom(), 0);
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.trim() && line.startsWith('data: ')) {
+              try {
+                const jsonStr = line.slice(6).trim(); // Remove 'data: ' prefix
+                if (!jsonStr) continue;
+                
+                const data = JSON.parse(jsonStr);
+                const chunk = data.chunk || '';
+                
+                if (chunk) {
+                  fullResponse += chunk;
+                  streamingMessageRef.current.content = fullResponse;
+                  // Update immediately for real-time display
+                  updateMessage(fullResponse);
+                }
+
+                // Handle completion
+                if (data.done) {
+                  // Update current chat ID if new chat was created
+                  if (data.chat_id && !currentChatId) {
+                    setCurrentChatId(data.chat_id);
+                  }
+                  
+                  // Refresh chat history
+                  loadChatHistory();
+
+                  // Text-to-speech if enabled
+                  if (voiceEnabled && 'speechSynthesis' in window && fullResponse) {
+                    const utterance = new SpeechSynthesisUtterance(fullResponse);
+                    window.speechSynthesis.speak(utterance);
+                  }
+                  
+                  streamingMessageRef.current = null;
+                }
+              } catch (e) {
+                console.error('Error parsing SSE data:', e, 'Line:', line);
+              }
+            }
+          }
         }
       } catch (error) {
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: 'Sorry, I couldn\'t connect to the server. Please make sure the backend is running on http://localhost:8000',
-          timestamp: new Date().toLocaleTimeString()
-        }]);
+        console.error('Streaming error:', error);
+        setMessages(prev => {
+          const updated = [...prev];
+          // Update the assistant message with error
+          if (assistantMessageIndex !== undefined && updated[assistantMessageIndex]) {
+            updated[assistantMessageIndex] = {
+              role: 'assistant',
+              content: 'Sorry, I couldn\'t connect to the server. Please make sure the backend is running on http://localhost:8000',
+              timestamp: new Date().toLocaleTimeString()
+            };
+          } else {
+            // Fallback: add error message
+            updated.push({
+              role: 'assistant',
+              content: 'Sorry, I couldn\'t connect to the server. Please make sure the backend is running on http://localhost:8000',
+              timestamp: new Date().toLocaleTimeString()
+            });
+          }
+          return updated;
+        });
+        streamingMessageRef.current = null;
       } finally {
         setIsLoading(false);
       }
@@ -585,10 +802,19 @@ export default function AIChat() {
                 }`}
               >
                 <Brain size={20} />
-                <div className="text-left">
+                <div className="text-left flex-1">
                   <div className="font-semibold text-sm">RAG Mode</div>
-                  <div className={`text-xs ${activeMode === 'rag' ? 'opacity-90' : 'opacity-60'}`}>Ollama Gemma 2B</div>
+                  <div className={`text-xs ${activeMode === 'rag' ? 'opacity-90' : 'opacity-60'} truncate`} title={currentRagModel}>
+                    {currentRagModel}
+                  </div>
                 </div>
+                <button
+                  onClick={() => setShowModelSelector(true)}
+                  className={`p-1.5 rounded ${activeMode === 'rag' ? (darkMode ? 'hover:bg-amber-700/40' : 'hover:bg-amber-700/20') : (darkMode ? 'hover:bg-gray-600/40' : 'hover:bg-white/60')} transition-all`}
+                  title="Change model"
+                >
+                  <Settings size={14} />
+                </button>
               </button>
               
               <button
@@ -600,10 +826,19 @@ export default function AIChat() {
                 }`}
               >
                 <Workflow size={20} />
-                <div className="text-left">
+                <div className="text-left flex-1">
                   <div className="font-semibold text-sm">Agent Mode</div>
-                  <div className={`text-xs ${activeMode === 'agent' ? 'opacity-90' : 'opacity-60'}`}>Tool Enhanced</div>
+                  <div className={`text-xs ${activeMode === 'agent' ? 'opacity-90' : 'opacity-60'} truncate`} title={currentAgentModel}>
+                    {currentAgentModel}
+                  </div>
                 </div>
+                <button
+                  onClick={() => setShowModelSelector(true)}
+                  className={`p-1.5 rounded ${activeMode === 'agent' ? (darkMode ? 'hover:bg-amber-700/40' : 'hover:bg-amber-700/20') : (darkMode ? 'hover:bg-gray-600/40' : 'hover:bg-white/60')} transition-all`}
+                  title="Change model"
+                >
+                  <Settings size={14} />
+                </button>
               </button>
             </div>
           </div>
@@ -912,7 +1147,9 @@ export default function AIChat() {
               {activeMode === 'rag' ? 'RAG Assistant' : 'Agent Assistant'}
             </h2>
             <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
-              {activeMode === 'rag' ? `Context: ${contextLength} • Tokens: ${tokenCount.total}` : 'Tool Enhanced • Multi-capability'}
+              {activeMode === 'rag' 
+                ? `Model: ${currentRagModel} • Context: ${contextLength} • Tokens: ${tokenCount.total}` 
+                : `Model: ${currentAgentModel} • Tool Enhanced • Multi-capability`}
             </p>
           </div>
 
@@ -985,7 +1222,12 @@ export default function AIChat() {
                       ))}
                     </div>
                   )}
-                  <div className="whitespace-pre-wrap">{msg.content}</div>
+                  <div className="whitespace-pre-wrap">
+                    {msg.content}
+                    {isLoading && idx === messages.length - 1 && msg.role === 'assistant' && (
+                      <span className="inline-block w-2 h-5 ml-1 bg-amber-600 animate-pulse" />
+                    )}
+                  </div>
                   
                   {/* Message Actions */}
                   {msg.role === 'assistant' && (
@@ -1193,6 +1435,203 @@ export default function AIChat() {
         onChange={handleCameraCapture}
         className="hidden"
       />
+
+      {/* Model Selector Dialog */}
+      {showModelSelector && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className={`${darkMode ? 'bg-gray-800' : 'bg-white'} rounded-2xl shadow-2xl max-w-2xl w-full p-6 space-y-4 max-h-[80vh] overflow-y-auto`}>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className={`text-lg font-bold ${darkMode ? 'text-gray-100' : 'text-gray-900'}`}>
+                  Select Ollama Model
+                </h3>
+                <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                  Choose a model for {activeMode === 'rag' ? 'RAG' : 'Agent'} mode
+                </p>
+              </div>
+              <button
+                onClick={() => setShowModelSelector(false)}
+                className={`p-2 rounded-lg ${darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
+              >
+                <X size={20} className={darkMode ? 'text-gray-400' : 'text-gray-600'} />
+              </button>
+            </div>
+
+            {/* Current Model */}
+            <div className={`p-4 rounded-lg ${darkMode ? 'bg-amber-600/20 border border-amber-600/30' : 'bg-amber-50 border border-amber-200'}`}>
+              <p className={`text-sm font-medium ${darkMode ? 'text-amber-400' : 'text-amber-800'} mb-1`}>
+                Current {activeMode === 'rag' ? 'RAG' : 'Agent'} Model:
+              </p>
+              <p className={`text-lg font-bold ${darkMode ? 'text-amber-300' : 'text-amber-900'}`}>
+                {activeMode === 'rag' ? currentRagModel : currentAgentModel}
+              </p>
+            </div>
+
+            {/* Available Models */}
+            <div>
+              <p className={`text-sm font-semibold ${darkMode ? 'text-gray-300' : 'text-gray-700'} mb-3`}>
+                Available Models ({availableModels.length})
+              </p>
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {availableModels.length === 0 ? (
+                  <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'} text-center py-4`}>
+                    No models found. Make sure Ollama is running.
+                  </p>
+                ) : (
+                  availableModels.map((model) => {
+                    const isCurrent = activeMode === 'rag' 
+                      ? model === currentRagModel 
+                      : model === currentAgentModel;
+                    return (
+                      <div
+                        key={model}
+                        className={`p-3 rounded-lg flex items-center justify-between ${
+                          isCurrent
+                            ? darkMode ? 'bg-amber-600/30 border border-amber-600/50' : 'bg-amber-100 border border-amber-300'
+                            : darkMode ? 'bg-gray-700/40 hover:bg-gray-700/60 border border-gray-600/30' : 'bg-white/60 hover:bg-white/80 border border-gray-200'
+                        } transition-all cursor-pointer`}
+                        onClick={() => {
+                          if (!isCurrent) {
+                            switchModel(model, activeMode);
+                            setShowModelSelector(false);
+                          }
+                        }}
+                      >
+                        <div className="flex-1">
+                          <div className={`font-medium ${darkMode ? 'text-gray-200' : 'text-gray-900'}`}>
+                            {model}
+                          </div>
+                          {isCurrent && (
+                            <div className={`text-xs mt-1 ${darkMode ? 'text-amber-400' : 'text-amber-700'}`}>
+                              Currently active
+                            </div>
+                          )}
+                        </div>
+                        {isCurrent && (
+                          <Check size={20} className={darkMode ? 'text-amber-400' : 'text-amber-600'} />
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* Popular Small Models to Download */}
+            <div>
+              <p className={`text-sm font-semibold ${darkMode ? 'text-gray-300' : 'text-gray-700'} mb-3`}>
+                Popular Small Models (Download)
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                {[
+                  { name: 'gemma2:2b', desc: 'Google Gemma 2B - Fast & Efficient' },
+                  { name: 'llama3.2:1b', desc: 'Meta Llama 3.2 1B - Ultra Small' },
+                  { name: 'llama3.2:3b', desc: 'Meta Llama 3.2 3B - Balanced' },
+                  { name: 'phi3:mini', desc: 'Microsoft Phi-3 Mini - Fast' },
+                  { name: 'qwen2.5:0.5b', desc: 'Qwen 2.5 0.5B - Tiny' },
+                  { name: 'tinyllama', desc: 'TinyLlama - Smallest' }
+                ].map((model) => {
+                  const isDownloading = downloadingModel === model.name;
+                  const isInstalled = availableModels.includes(model.name);
+                  return (
+                    <div
+                      key={model.name}
+                      className={`p-3 rounded-lg flex items-center justify-between ${
+                        darkMode ? 'bg-gray-700/40 border border-gray-600/30' : 'bg-white/60 border border-gray-200'
+                      }`}
+                    >
+                      <div className="flex-1">
+                        <div className={`font-medium ${darkMode ? 'text-gray-200' : 'text-gray-900'}`}>
+                          {model.name}
+                        </div>
+                        <div className={`text-xs mt-1 ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                          {model.desc}
+                        </div>
+                        {isDownloading && (
+                          <div className={`text-xs mt-1 ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}>
+                            {downloadProgress}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => !isInstalled && !isDownloading && downloadModel(model.name)}
+                        disabled={isInstalled || isDownloading}
+                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                          isInstalled
+                            ? darkMode ? 'bg-gray-600/40 text-gray-400 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed'
+                            : isDownloading
+                            ? darkMode ? 'bg-amber-600/40 text-amber-300 cursor-not-allowed' : 'bg-amber-200 text-amber-700 cursor-not-allowed'
+                            : darkMode ? 'bg-amber-600/30 hover:bg-amber-600/40 text-amber-400' : 'bg-amber-600/80 hover:bg-amber-600/90 text-white'
+                        }`}
+                      >
+                        {isInstalled ? (
+                          <>
+                            <Check size={16} className="inline mr-1" />
+                            Installed
+                          </>
+                        ) : isDownloading ? (
+                          <>
+                            <RefreshCw size={16} className="inline mr-1 animate-spin" />
+                            Downloading...
+                          </>
+                        ) : (
+                          <>
+                            <Download size={16} className="inline mr-1" />
+                            Download
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Custom Model Input */}
+            <div>
+              <p className={`text-sm font-semibold ${darkMode ? 'text-gray-300' : 'text-gray-700'} mb-3`}>
+                Download Custom Model
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="e.g., llama3.2:1b"
+                  id="customModelInput"
+                  className={`flex-1 px-4 py-2 rounded-lg border ${
+                    darkMode 
+                      ? 'bg-gray-700 border-gray-600 text-gray-100 placeholder-gray-400' 
+                      : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
+                  } focus:outline-none focus:ring-2 focus:ring-amber-500`}
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter') {
+                      const input = document.getElementById('customModelInput');
+                      if (input && input.value.trim()) {
+                        downloadModel(input.value.trim());
+                        input.value = '';
+                      }
+                    }
+                  }}
+                />
+                <button
+                  onClick={() => {
+                    const input = document.getElementById('customModelInput');
+                    if (input && input.value.trim()) {
+                      downloadModel(input.value.trim());
+                      input.value = '';
+                    }
+                  }}
+                  className={`px-4 py-2 rounded-lg font-medium ${
+                    darkMode ? 'bg-amber-600/30 hover:bg-amber-600/40 text-amber-400' : 'bg-amber-600/80 hover:bg-amber-600/90 text-white'
+                  } transition-all`}
+                >
+                  <Download size={16} className="inline mr-1" />
+                  Download
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* File Location Dialog */}
       {showFileLocationDialog && (

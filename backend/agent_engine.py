@@ -50,6 +50,108 @@ class AgentEngine:
         except:
             return False
     
+    def switch_model(self, model_name: str) -> bool:
+        """Switch to a different Ollama model and preload it"""
+        try:
+            # Verify model exists
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                model_names = [m.get('name', '') for m in models]
+                if model_name in model_names:
+                    old_model = self.model_name
+                    self.model_name = model_name
+                    # Update task orchestrator model
+                    self.task_orchestrator.model_name = model_name
+                    print(f"🔄 Switching Agent model from {old_model} to {model_name}...")
+                    
+                    # Give Ollama a moment to unload the previous model
+                    import time
+                    time.sleep(0.5)
+                    
+                    # Preload the new model to avoid EOF errors on first request
+                    if self._preload_model():
+                        print(f"✅ Switched Agent model to: {model_name} (preloaded)")
+                        return True
+                    else:
+                        print(f"⚠️ Switched Agent model to: {model_name} (preload failed, but will try on first request)")
+                        # Still return True - the model switch succeeded, preload is just optimization
+                        return True
+                else:
+                    print(f"⚠️ Model {model_name} not found. Available models: {model_names}")
+                    return False
+            return False
+        except Exception as e:
+            print(f"❌ Error switching model: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _preload_model(self) -> bool:
+        """Preload the model to avoid EOF errors during first request"""
+        try:
+            print(f"🔄 Preloading model {self.model_name}...")
+            # Make a small test request to load the model
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": "test",
+                    "stream": False,
+                    "options": {
+                        "num_predict": 1,  # Just generate 1 token to load the model
+                        "num_ctx": 128
+                    }
+                },
+                timeout=60
+            )
+            if response.status_code == 200:
+                print(f"✅ Model {self.model_name} preloaded successfully")
+                return True
+            else:
+                error_text = response.text
+                # Check for EOF/model loading errors
+                if "load" in error_text.lower() and ("EOF" in error_text or "connection" in error_text.lower()):
+                    print(f"⚠️ Model preload failed with loading error: {error_text}")
+                    # Retry once after a short delay
+                    import time
+                    time.sleep(1)
+                    try:
+                        response = requests.post(
+                            f"{self.ollama_url}/api/generate",
+                            json={
+                                "model": self.model_name,
+                                "prompt": "test",
+                                "stream": False,
+                                "options": {
+                                    "num_predict": 1,
+                                    "num_ctx": 128
+                                }
+                            },
+                            timeout=60
+                        )
+                        if response.status_code == 200:
+                            print(f"✅ Model {self.model_name} preloaded successfully on retry")
+                            return True
+                    except:
+                        pass
+                print(f"⚠️ Model preload returned status {response.status_code}: {error_text}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Model preload failed: {e}")
+            return False
+    
+    def get_available_models(self) -> List[str]:
+        """Get list of available Ollama models"""
+        try:
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                return [m.get('name', '') for m in models]
+            return []
+        except:
+            return []
+    
     def _is_task_request(self, message: str) -> bool:
         """Detect if the message contains task execution requests (optimized for speed)"""
         message_lower = message.lower()
@@ -249,3 +351,127 @@ class AgentEngine:
             return result.get('response', 'No response generated')
         else:
             return f"Error: Agent mode returned status code {response.status_code}"
+    
+    async def generate_response_stream(
+        self,
+        message: str,
+        system_prompt: str,
+        history: List[Dict],
+        temperature: float = 0.8,
+        context_length: int = 2048
+    ):
+        """Generate response with streaming support - yields chunks as they arrive"""
+        try:
+            if not self.is_available():
+                yield "data: " + json.dumps({"chunk": "⚠️ Ollama is not running for Agent mode.\n\nPlease start it with: ollama serve", "done": True}) + "\n\n"
+                return
+            
+            # Check if this is a task execution request
+            if self._is_task_request(message):
+                # For task execution, we'll stream the results as they come
+                # But task execution is complex, so we'll do it non-streaming for now
+                # and just stream the final result
+                print(f"🤖 Agent mode: Detected task execution request")
+                result = await self._execute_tasks(message, system_prompt, return_structured=False)
+                yield "data: " + json.dumps({"chunk": result, "done": True}) + "\n\n"
+                return
+            
+            # Build conversation context
+            conversation = []
+            for msg in history[-5:]:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                if role == 'user':
+                    conversation.append(f"User: {content}")
+                elif role == 'assistant':
+                    conversation.append(f"Assistant: {content}")
+            
+            # Simplified system prompt
+            agent_system = f"{system_prompt}\n\nYou are a helpful AI assistant with task execution capabilities."
+            
+            # Build prompt
+            prompt = f"{agent_system}\n\n"
+            if conversation:
+                prompt += "\n".join(conversation[-3:]) + "\n\n"
+            prompt += f"User: {message}\nAssistant:"
+            
+            print(f"📤 Agent mode: Processing chat request with streaming...")
+            
+            # Use async HTTP if available for streaming
+            if self.async_client:
+                try:
+                    async with self.async_client.stream(
+                        'POST',
+                        f"{self.ollama_url}/api/generate",
+                        json={
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "stream": True,
+                            "options": {
+                                "num_ctx": context_length,
+                                "temperature": temperature,
+                                "num_predict": min(context_length, 2048),
+                            }
+                        },
+                        timeout=120.0
+                    ) as response:
+                        if response.status_code == 200:
+                            async for line in response.aiter_lines():
+                                if line:
+                                    try:
+                                        data = json.loads(line)
+                                        chunk = data.get('response', '')
+                                        if chunk:
+                                            # Yield immediately for each chunk
+                                            yield "data: " + json.dumps({"chunk": chunk, "done": False}) + "\n\n"
+                                        
+                                        if data.get('done', False):
+                                            yield "data: " + json.dumps({"chunk": "", "done": True}) + "\n\n"
+                                            break
+                                    except json.JSONDecodeError:
+                                        continue
+                        else:
+                            yield "data: " + json.dumps({"chunk": f"Error: Agent mode returned status code {response.status_code}", "done": True}) + "\n\n"
+                    return
+                except Exception as e:
+                    print(f"⚠️ Async streaming failed, falling back to sync: {e}")
+            
+            # Fallback to synchronous streaming
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {
+                        "num_ctx": 2048,
+                        "temperature": 0.8,
+                        "num_predict": 500,
+                    }
+                },
+                stream=True,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                for line in response.iter_lines(decode_unicode=True):
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            chunk = data.get('response', '')
+                            if chunk:
+                                # Yield immediately for each chunk
+                                yield "data: " + json.dumps({"chunk": chunk, "done": False}) + "\n\n"
+                            
+                            if data.get('done', False):
+                                yield "data: " + json.dumps({"chunk": "", "done": True}) + "\n\n"
+                                break
+                        except json.JSONDecodeError:
+                            continue
+            else:
+                yield "data: " + json.dumps({"chunk": f"Error: Agent mode returned status code {response.status_code}", "done": True}) + "\n\n"
+        
+        except requests.exceptions.ConnectionError:
+            yield "data: " + json.dumps({"chunk": "❌ Cannot connect to Ollama for Agent mode.\n\nPlease ensure Ollama is running: ollama serve", "done": True}) + "\n\n"
+        except Exception as e:
+            yield "data: " + json.dumps({"chunk": f"❌ Agent Error: {str(e)}", "done": True}) + "\n\n"

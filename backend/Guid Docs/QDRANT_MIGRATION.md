@@ -95,3 +95,5 @@ pip install qdrant-client
 - Ensure Qdrant is using local storage (not in-memory)
 - Check collection info for vector count
 
+
+

@@ -11,6 +11,18 @@ Features:
 - Citation and source reference support
 """
 
+import warnings
+# Suppress FutureWarning about resume_download deprecation in huggingface_hub
+# This is fixed in newer versions of sentence-transformers and transformers
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*resume_download.*')
+
+import os
+# Disable TensorFlow in transformers (we use PyTorch only)
+# This prevents transformers from trying to import TensorFlow modules
+# Must be set before importing transformers or sentence_transformers
+os.environ.setdefault('USE_TF', '0')
+os.environ.setdefault('USE_TORCH', '1')
+
 import requests
 import json
 from typing import List, Dict, Tuple, Optional, Any
@@ -21,7 +33,6 @@ import uuid
 from database import get_database
 from vector_store import QdrantVectorStore, QDRANT_AVAILABLE
 import re
-import os
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -97,12 +108,11 @@ try:
 except ImportError:
     PYGMENTS_AVAILABLE = False
 
-# OCR
-try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-except ImportError:
-    EASYOCR_AVAILABLE = False
+# OCR - Lazy import to avoid TensorFlow import at module level
+# easyocr imports TensorFlow, which causes issues with transformers
+EASYOCR_AVAILABLE = False
+easyocr = None
+# We'll import easyocr lazily only when actually needed for OCR
 
 try:
     import pytesseract
@@ -178,13 +188,23 @@ class AdvancedOCREngine:
     
     def __init__(self):
         self.easyocr_reader = None
-        self.use_easyocr = EASYOCR_AVAILABLE
+        self.use_easyocr = False
         self.easyocr_gpu = False  # Track if GPU is enabled
+        
+        # Lazy import easyocr to avoid TensorFlow import at module level
+        # This prevents TensorFlow from being imported before we can disable it in transformers
+        try:
+            import easyocr
+            self.easyocr_module = easyocr
+            self.use_easyocr = True
+        except ImportError:
+            self.easyocr_module = None
+            self.use_easyocr = False
         
         # Check if GPU should be forced to CPU for OCR
         force_cpu_ocr = os.getenv('FORCE_CPU_OCR', 'false').lower() == 'true'
         
-        if self.use_easyocr:
+        if self.use_easyocr and self.easyocr_module:
             try:
                 # Try GPU first if not forced to CPU
                 if not force_cpu_ocr:
@@ -194,7 +214,7 @@ class AdvancedOCREngine:
                             # Clear GPU cache before initializing
                             torch.cuda.empty_cache()
                             print("🔄 Initializing EasyOCR with GPU...")
-                            self.easyocr_reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+                            self.easyocr_reader = self.easyocr_module.Reader(['en'], gpu=True, verbose=False)
                             self.easyocr_gpu = True
                             print("✅ EasyOCR initialized with GPU")
                         else:
@@ -202,13 +222,13 @@ class AdvancedOCREngine:
                     except Exception as gpu_error:
                         # GPU initialization failed, try CPU
                         print(f"⚠️ GPU initialization failed: {gpu_error}, trying CPU...")
-                        self.easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                        self.easyocr_reader = self.easyocr_module.Reader(['en'], gpu=False, verbose=False)
                         self.easyocr_gpu = False
                         print("✅ EasyOCR initialized with CPU")
                 else:
                     # Force CPU mode
                     print("🔄 Initializing EasyOCR with CPU (forced)...")
-                    self.easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                    self.easyocr_reader = self.easyocr_module.Reader(['en'], gpu=False, verbose=False)
                     self.easyocr_gpu = False
                     print("✅ EasyOCR initialized with CPU")
             except Exception as e:
@@ -236,7 +256,7 @@ class AdvancedOCREngine:
         return Image.fromarray(binary)
     
     def extract_text(self, image: Image.Image, filename: str = "") -> str:
-        """Extract text from image"""
+        """Extract text from image with improved structure preservation"""
         try:
             processed_image = self.preprocess_image(image)
             
@@ -249,11 +269,61 @@ class AdvancedOCREngine:
                             torch.cuda.empty_cache()
                     
                     results = self.easyocr_reader.readtext(np.array(processed_image))
+                    
+                    # Improved extraction with spatial awareness
+                    if not results:
+                        return ""
+                    
+                    # Sort by vertical position (top to bottom), then horizontal (left to right)
+                    # This preserves reading order and document structure
+                    sorted_results = sorted(results, key=lambda x: (
+                        (x[0][0][1] + x[0][2][1]) / 2,  # Average Y coordinate (top to bottom)
+                        (x[0][0][0] + x[0][2][0]) / 2   # Average X coordinate (left to right)
+                    ))
+                    
                     text_parts = []
-                    for (bbox, text, confidence) in results:
-                        if confidence > 0.3:
-                            text_parts.append(text)
+                    current_line = []
+                    last_y = None
+                    line_height_threshold = 0.05 * image.height  # 5% of image height
+                    
+                    for (bbox, text, confidence) in sorted_results:
+                        if confidence < 0.3:
+                            continue
+                        
+                        # Calculate bounding box properties
+                        y_center = (bbox[0][1] + bbox[2][1]) / 2
+                        x_center = (bbox[0][0] + bbox[2][0]) / 2
+                        bbox_height = abs(bbox[2][1] - bbox[0][1])
+                        
+                        # Group text into lines based on vertical position
+                        if last_y is None or abs(y_center - last_y) > line_height_threshold:
+                            # New line - flush current line
+                            if current_line:
+                                # Sort current line by X position and join
+                                current_line.sort(key=lambda x: x[1])  # Sort by x_center
+                                line_text = ' '.join([item[0] for item in current_line])
+                                text_parts.append(line_text)
+                                current_line = []
+                            
+                            last_y = y_center
+                        
+                        # Add to current line
+                        current_line.append((text, x_center, confidence))
+                    
+                    # Flush remaining line
+                    if current_line:
+                        current_line.sort(key=lambda x: x[1])
+                        line_text = ' '.join([item[0] for item in current_line])
+                        text_parts.append(line_text)
+                    
+                    # Join with newlines to preserve structure
                     extracted_text = '\n'.join(text_parts)
+                    
+                    # Post-process to improve readability
+                    # Remove excessive whitespace but preserve line breaks
+                    extracted_text = re.sub(r'[ \t]+', ' ', extracted_text)  # Multiple spaces to single
+                    extracted_text = re.sub(r'\n{3,}', '\n\n', extracted_text)  # Multiple newlines to double
+                    
                     if extracted_text.strip():
                         return extracted_text
                 except RuntimeError as e:
@@ -431,21 +501,25 @@ class DocumentProcessor:
                         except:
                             pass
                     
-                    # Combine text
+                    # Combine text with better structure preservation
                     full_text = page_text
                     if ocr_texts:
-                        full_text += "\n\n[Images OCR]\n" + "\n".join(ocr_texts)
+                        # Add OCR text with clear markers
+                        full_text += "\n\n[Images/OCR Content]\n" + "\n".join(ocr_texts)
                     
                     if full_text.strip():
-                        # Clean text
+                        # Clean text but preserve structure
                         cleaned_text = self.cleaner.clean(full_text)
                         
+                        # Preserve page context in metadata for better chunking
                         documents.append(Document(
                             page_content=cleaned_text,
                             metadata={
                                 "source": filename,
                                 "page": page_num + 1,
-                                "type": "pdf"
+                                "type": "pdf",
+                                "page_number": page_num + 1,
+                                "total_pages": len(doc) if hasattr(doc, '__len__') else None
                             }
                         ))
                 
@@ -909,7 +983,7 @@ class RAGEngine:
         model_name: str = "gemma3:4b",
         ollama_url: str = "http://localhost:11434",
         device: Optional[str] = None,
-        embedding_model: str = "nomic-embed-text-v1"  # or "mxbai-embed-large"
+        embedding_model: str = "nomic-ai/nomic-embed-text-v1"  # or "BAAI/bge-large-en-v1.5"
     ):
         self.model_name = model_name
         self.ollama_url = ollama_url
@@ -955,16 +1029,30 @@ class RAGEngine:
         try:
             # Try to load specified model
             try:
-                self.embeddings_model = SentenceTransformer(embedding_model, device=device)
+                # Check if this is a nomic-ai model that requires trust_remote_code
+                trust_remote = "nomic-ai" in embedding_model.lower()
+                self.embeddings_model = SentenceTransformer(
+                    embedding_model, 
+                    device=device,
+                    trust_remote_code=trust_remote
+                )
                 embedding_dim = self.embeddings_model.get_sentence_embedding_dimension()
                 print(f"✅ Loaded {embedding_model} on {device} (dim: {embedding_dim})")
-            except:
+            except Exception as e1:
                 # Fallback to alternatives
+                print(f"⚠️ Failed to load {embedding_model}: {e1}")
                 try:
-                    self.embeddings_model = SentenceTransformer("nomic-embed-text-v1", device=device)
+                    # Try with correct HuggingFace path and trust_remote_code
+                    self.embeddings_model = SentenceTransformer(
+                        "nomic-ai/nomic-embed-text-v1", 
+                        device=device,
+                        trust_remote_code=True
+                    )
                     embedding_dim = self.embeddings_model.get_sentence_embedding_dimension()
-                    print(f"✅ Loaded nomic-embed-text-v1 on {device} (dim: {embedding_dim})")
-                except:
+                    print(f"✅ Loaded nomic-ai/nomic-embed-text-v1 on {device} (dim: {embedding_dim})")
+                except Exception as e2:
+                    print(f"⚠️ Failed to load nomic-ai/nomic-embed-text-v1: {e2}")
+                    # Final fallback
                     self.embeddings_model = SentenceTransformer("all-mpnet-base-v2", device=device)
                     embedding_dim = self.embeddings_model.get_sentence_embedding_dimension()
                     print(f"✅ Loaded all-mpnet-base-v2 on {device} (dim: {embedding_dim})")
@@ -992,8 +1080,21 @@ class RAGEngine:
                 if self.vector_store.use_memory:
                     print("⚠️  Note: Using in-memory Qdrant (data will not persist between restarts)")
                     print("   To use persistent storage, ensure no other instances are running")
+                    print("   ⚠️  Previously indexed documents will NOT be available in in-memory mode!")
                 else:
                     print("✅ Qdrant vector database initialized (persistent)")
+                    # Check and display collection statistics
+                    try:
+                        collection_info = self.vector_store.get_collection_info()
+                        if collection_info:
+                            points_count = collection_info.get('points_count', 0)
+                            if points_count > 0:
+                                print(f"📚 Loaded {points_count} indexed document chunks from previous sessions")
+                                print(f"   These documents are ready for RAG queries")
+                            else:
+                                print(f"📝 Collection is empty - ready for new document indexing")
+                    except Exception as e:
+                        print(f"⚠️ Could not retrieve collection info: {e}")
             else:
                 print("⚠️ Qdrant not available. Install with: pip install qdrant-client")
                 raise ImportError("Qdrant not available")
@@ -1030,6 +1131,142 @@ class RAGEngine:
         self._load_knowledge_base()
         
         print(f"✅ RAG Engine initialized")
+    
+    def _is_conversational_message(self, message: str) -> bool:
+        """Detect if message is a conversational/greeting message that doesn't need document context"""
+        message_lower = message.lower().strip()
+        
+        # Very short messages (likely greetings)
+        if len(message_lower) <= 10:
+            conversational_patterns = [
+                'hey', 'hi', 'hello', 'hola', 'hey there', 'hi there',
+                'howdy', 'greetings', 'good morning', 'good afternoon', 
+                'good evening', 'gm', 'gn', 'sup', 'yo', 'what\'s up',
+                'wassup', 'how are you', 'how are ya', 'how\'s it going',
+                'thanks', 'thank you', 'thx', 'ty', 'ok', 'okay', 'k',
+                'yes', 'no', 'yep', 'nope', 'sure', 'cool', 'nice', 'great'
+            ]
+            if message_lower in conversational_patterns:
+                return True
+        
+        # Greeting patterns
+        greeting_patterns = [
+            r'^(hey|hi|hello|hola|howdy|greetings)',
+            r'^(good (morning|afternoon|evening|day))',
+            r'^(how are you|how\'?s it going|how are things)',
+            r'^(what\'?s up|wassup|sup)',
+            r'^(thanks|thank you|thx|ty)',
+            r'^(ok|okay|sure|yep|nope|yes|no)$'
+        ]
+        
+        for pattern in greeting_patterns:
+            if re.match(pattern, message_lower):
+                return True
+        
+        # Very casual/short responses
+        if len(message_lower.split()) <= 3 and not any(word in message_lower for word in ['what', 'who', 'when', 'where', 'why', 'how', 'which', 'explain', 'tell', 'describe', 'what is', 'what are']):
+            return True
+        
+        return False
+    
+    def _needs_document_context(self, message: str, filter_doc_ids: Optional[List[str]] = None) -> bool:
+        """Determine if message needs document context retrieval"""
+        # If documents are explicitly selected, always try to use them
+        if filter_doc_ids and len(filter_doc_ids) > 0:
+            return True
+        
+        # If it's a conversational message, don't search documents
+        if self._is_conversational_message(message):
+            return False
+        
+        # Check for question words or document-related queries
+        message_lower = message.lower()
+        question_indicators = [
+            'what', 'who', 'when', 'where', 'why', 'how', 'which',
+            'explain', 'describe', 'tell me', 'what is', 'what are',
+            'summarize', 'analyze', 'find', 'search', 'look for',
+            'according to', 'in the document', 'from the doc',
+            'based on', 'document says', 'it says', 'mentioned'
+        ]
+        
+        # If contains question indicators, likely needs context
+        if any(indicator in message_lower for indicator in question_indicators):
+            return True
+        
+        # If message is longer and seems like a substantive query
+        if len(message.split()) > 5:
+            return True
+        
+        # Default: don't search for very short messages
+        return False
+    
+    def _is_conversational_message(self, message: str) -> bool:
+        """Detect if message is a conversational/greeting message that doesn't need document context"""
+        message_lower = message.lower().strip()
+        
+        # Very short messages (likely greetings)
+        if len(message_lower) <= 10:
+            conversational_patterns = [
+                'hey', 'hi', 'hello', 'hola', 'hey there', 'hi there',
+                'howdy', 'greetings', 'good morning', 'good afternoon', 
+                'good evening', 'gm', 'gn', 'sup', 'yo', 'what\'s up',
+                'wassup', 'how are you', 'how are ya', 'how\'s it going',
+                'thanks', 'thank you', 'thx', 'ty', 'ok', 'okay', 'k',
+                'yes', 'no', 'yep', 'nope', 'sure', 'cool', 'nice', 'great'
+            ]
+            if message_lower in conversational_patterns:
+                return True
+        
+        # Greeting patterns
+        greeting_patterns = [
+            r'^(hey|hi|hello|hola|howdy|greetings)',
+            r'^(good (morning|afternoon|evening|day))',
+            r'^(how are you|how\'?s it going|how are things)',
+            r'^(what\'?s up|wassup|sup)',
+            r'^(thanks|thank you|thx|ty)',
+            r'^(ok|okay|sure|yep|nope|yes|no)$'
+        ]
+        
+        for pattern in greeting_patterns:
+            if re.match(pattern, message_lower):
+                return True
+        
+        # Very casual/short responses
+        if len(message_lower.split()) <= 3 and not any(word in message_lower for word in ['what', 'who', 'when', 'where', 'why', 'how', 'which', 'explain', 'tell', 'describe', 'what is', 'what are']):
+            return True
+        
+        return False
+    
+    def _needs_document_context(self, message: str, filter_doc_ids: Optional[List[str]] = None) -> bool:
+        """Determine if message needs document context retrieval"""
+        # If documents are explicitly selected, always try to use them
+        if filter_doc_ids and len(filter_doc_ids) > 0:
+            return True
+        
+        # If it's a conversational message, don't search documents
+        if self._is_conversational_message(message):
+            return False
+        
+        # Check for question words or document-related queries
+        message_lower = message.lower()
+        question_indicators = [
+            'what', 'who', 'when', 'where', 'why', 'how', 'which',
+            'explain', 'describe', 'tell me', 'what is', 'what are',
+            'summarize', 'analyze', 'find', 'search', 'look for',
+            'according to', 'in the document', 'from the doc',
+            'based on', 'document says', 'it says', 'mentioned'
+        ]
+        
+        # If contains question indicators, likely needs context
+        if any(indicator in message_lower for indicator in question_indicators):
+            return True
+        
+        # If message is longer and seems like a substantive query
+        if len(message.split()) > 5:
+            return True
+        
+        # Default: don't search for very short messages
+        return False
     
     def _load_knowledge_base(self):
         """Load documents from knowledge base directory"""
@@ -1313,6 +1550,24 @@ class RAGEngine:
             filter_doc_ids: Optional list of doc_ids to filter by
         """
         try:
+            # Check if vector store is available and has data
+            if not self.vector_store:
+                print("❌ Vector store not available - cannot retrieve context")
+                return "", []
+            
+            # Verify collection has data
+            try:
+                collection_info = self.vector_store.get_collection_info()
+                points_count = collection_info.get('points_count', 0) if collection_info else 0
+                if points_count == 0:
+                    print("⚠️ Vector store collection is empty - no documents indexed yet")
+                    print("   Please upload and index documents first")
+                    return "", []
+                else:
+                    print(f"🔍 Searching in {points_count} indexed document chunks...")
+            except Exception as e:
+                print(f"⚠️ Could not verify collection: {e}")
+            
             # Generate query embedding
             query_embedding = self.embeddings_model.encode(
                 query,
@@ -1340,7 +1595,8 @@ class RAGEngine:
                             query_text=query,
                             top_k=top_k * 3,  # Get more for filtering and re-ranking
                             semantic_weight=0.7,
-                            keyword_weight=0.3
+                            keyword_weight=0.3,
+                            filter_conditions=filter_conditions
                         )
                     else:
                         # Use semantic search only
@@ -1421,20 +1677,39 @@ class RAGEngine:
                 except Exception as e:
                     print(f"⚠️ Re-ranking failed: {e}")
             
-            # Get top-k
-            top_results = results[:top_k]
+            # Expand context by including surrounding chunks from same document
+            expanded_results = self._expand_context_with_surrounding_chunks(results, top_k)
             
-            # Format context with citations
+            # Get top-k expanded results
+            top_results = expanded_results[:top_k]
+            
+            print(f"📋 Processing {len(top_results)} top results (with context expansion) for context formatting")
+            
+            # Format context with citations - now includes expanded context
             context_parts = []
             citations = []
+            seen_chunks = set()  # Avoid duplicate chunks
             
             for i, result in enumerate(top_results):
                 text = result.get('text', '')
+                chunk_id = result.get('chunk_id', f"{result.get('doc_id', '')}_{result.get('chunk_index', i)}")
+                
+                if not text or not text.strip():
+                    print(f"⚠️ Skipping result {i+1}: empty text")
+                    continue
+                
+                # Skip if we've already included this chunk
+                if chunk_id in seen_chunks:
+                    continue
+                seen_chunks.add(chunk_id)
+                    
                 metadata = result.get('metadata', {})
                 source = metadata.get('source', result.get('source', 'unknown'))
                 page = metadata.get('page', '')
                 section = metadata.get('section', '')
                 doc_id = result.get('doc_id', '')
+                chunk_index = result.get('chunk_index', '')
+                is_expanded = result.get('is_expanded_context', False)
                 
                 # Create citation
                 citation = f"[{i+1}]"
@@ -1445,6 +1720,9 @@ class RAGEngine:
                 else:
                     citation += f" {source}"
                 
+                if is_expanded:
+                    citation += " (expanded context)"
+                
                 citations.append({
                     'number': i + 1,
                     'text': text[:200] + "..." if len(text) > 200 else text,
@@ -1452,19 +1730,151 @@ class RAGEngine:
                     'page': page,
                     'section': section,
                     'doc_id': doc_id,
+                    'chunk_index': chunk_index,
                     'similarity': result.get('similarity', 0.0),
-                    'rerank_score': result.get('rerank_score', None)
+                    'rerank_score': result.get('rerank_score', None),
+                    'is_expanded': is_expanded
                 })
                 
                 context_parts.append(f"{citation}\n{text}")
             
             context = '\n\n'.join(context_parts)
             
+            if context:
+                context_length = len(context)
+                print(f"✅ Context formatted: {len(citations)} chunks, {context_length} characters")
+                print(f"   Context preview: {context[:200]}...")
+            else:
+                print(f"⚠️ No context generated from {len(top_results)} results")
+            
             return context, citations
         
         except Exception as e:
             print(f"⚠️ Error retrieving context: {e}")
             return "", []
+    
+    def _expand_context_with_surrounding_chunks(self, results: List[Dict], top_k: int) -> List[Dict]:
+        """Expand context by including surrounding chunks from the same document
+        
+        This helps the LLM make decisions based on the whole document context,
+        not just isolated chunks. It scans through the entire document context
+        to provide comprehensive information.
+        """
+        if not results or not self.vector_store:
+            return results
+        
+        expanded_results = []
+        processed_docs = {}  # Track which doc_id + chunk_index combinations we've processed
+        
+        # Group results by doc_id to find neighbors more efficiently
+        doc_groups = {}
+        for result in results[:top_k * 2]:  # Process more results to find neighbors
+            doc_id = result.get('doc_id')
+            if doc_id:
+                if doc_id not in doc_groups:
+                    doc_groups[doc_id] = []
+                doc_groups[doc_id].append(result)
+        
+        # Process each document group
+        for doc_id, doc_results in doc_groups.items():
+            try:
+                # Get all chunks from this document
+                filter_conditions = {"doc_id": [doc_id]}
+                
+                # Use a representative query embedding (average of top results)
+                query_texts = [r.get('text', '') for r in doc_results[:3] if r.get('text')]
+                if query_texts:
+                    query_embedding = self.embeddings_model.encode(
+                        ' '.join(query_texts),
+                        convert_to_numpy=True,
+                        normalize_embeddings=True
+                    )
+                else:
+                    continue
+                
+                # Search for all chunks from this document
+                all_doc_chunks = self.vector_store.search(
+                    query_embedding=query_embedding,
+                    top_k=200,  # Get many chunks to find neighbors
+                    filter_conditions=filter_conditions,
+                    score_threshold=0.0  # Get all chunks regardless of similarity
+                )
+                
+                # Create a map of chunk_index -> chunk for quick lookup
+                chunk_map = {}
+                for chunk in all_doc_chunks:
+                    chunk_idx = chunk.get('chunk_index')
+                    if chunk_idx is not None:
+                        chunk_map[chunk_idx] = chunk
+                
+                # For each result, find and add neighboring chunks
+                for result in doc_results:
+                    chunk_index = result.get('chunk_index')
+                    
+                    if chunk_index is None:
+                        # Can't expand without chunk_index
+                        if (doc_id, -1) not in processed_docs:
+                            expanded_results.append(result)
+                            processed_docs[(doc_id, -1)] = True
+                        continue
+                    
+                    key = (doc_id, chunk_index)
+                    if key in processed_docs:
+                        continue
+                    processed_docs[key] = True
+                    
+                    # Add the original result
+                    expanded_results.append(result)
+                    
+                    # Find neighboring chunks (2 before and 2 after)
+                    neighbor_indices = [
+                        chunk_index - 2, chunk_index - 1,  # Previous chunks
+                        chunk_index + 1, chunk_index + 2   # Next chunks
+                    ]
+                    
+                    neighbors = []
+                    for neighbor_idx in neighbor_indices:
+                        if neighbor_idx in chunk_map:
+                            neighbor = chunk_map[neighbor_idx].copy()
+                            neighbor_key = (neighbor.get('doc_id'), neighbor_idx)
+                            
+                            # Only add if not already processed
+                            if neighbor_key not in processed_docs:
+                                # Mark as expanded context
+                                neighbor['is_expanded_context'] = True
+                                neighbor['original_similarity'] = result.get('similarity', 0.0)
+                                # Slightly lower similarity for expanded chunks
+                                neighbor['similarity'] = result.get('similarity', 0.0) * 0.85
+                                neighbors.append(neighbor)
+                    
+                    # Sort neighbors by chunk_index to maintain document order
+                    neighbors.sort(key=lambda x: x.get('chunk_index', 0))
+                    
+                    # Add neighbors (limit to 4 total: 2 before, 2 after)
+                    for neighbor in neighbors[:4]:
+                        neighbor_key = (neighbor.get('doc_id'), neighbor.get('chunk_index'))
+                        if neighbor_key not in processed_docs:
+                            expanded_results.append(neighbor)
+                            processed_docs[neighbor_key] = True
+                            
+            except Exception as e:
+                print(f"⚠️ Error expanding context for document {doc_id}: {e}")
+                # Add original results if expansion fails
+                for result in doc_results:
+                    key = (result.get('doc_id'), result.get('chunk_index', -1))
+                    if key not in processed_docs:
+                        expanded_results.append(result)
+                        processed_docs[key] = True
+                continue
+        
+        # Re-sort by similarity (original results first, then expanded)
+        expanded_results.sort(key=lambda x: (
+            not x.get('is_expanded_context', False),  # Original results first
+            -x.get('similarity', 0.0)  # Then by similarity descending
+        ))
+        
+        print(f"📚 Context expansion: {len(results)} original → {len(expanded_results)} expanded chunks")
+        return expanded_results
     
     async def generate_response(
         self,
@@ -1491,18 +1901,34 @@ class RAGEngine:
             if not query:
                 return "Please provide a question or query."
             
-            # Retrieve context with citations
-            # Increase top_k for better context (especially for summarization and analysis)
-            query_lower = query.lower()
-            is_analysis_query = any(word in query_lower for word in ["summar", "conclusion", "analyze", "synthesize", "overview", "key points", "main ideas", "summary"])
-            # Use more chunks for analysis queries to get better context for summarization
-            retrieval_k = top_k * 2 if is_analysis_query else top_k
-            context, citations = await self.retrieve_context(query, top_k=retrieval_k, min_similarity=0.2, filter_doc_ids=filter_doc_ids)
+            # Determine if this needs document context
+            needs_context = self._needs_document_context(query, filter_doc_ids)
+            context = ""
+            citations = []
             
-            if context:
-                print(f"📊 Retrieved {len(citations)} relevant chunks")
+            if needs_context:
+                # Retrieve context with citations
+                # Increase top_k for better context (especially for summarization and analysis)
+                query_lower = query.lower()
+                is_analysis_query = any(word in query_lower for word in ["summar", "conclusion", "analyze", "synthesize", "overview", "key points", "main ideas", "summary"])
+                # Use more chunks for analysis queries to get better context for summarization
+                retrieval_k = top_k * 2 if is_analysis_query else top_k
+                
+                print(f"🔍 Retrieving context for query: '{query[:100]}...'")
+                if filter_doc_ids:
+                    print(f"📄 Filtering to selected documents: {filter_doc_ids}")
+                else:
+                    print(f"📚 Searching all documents in knowledge base")
+                
+                context, citations = await self.retrieve_context(query, top_k=retrieval_k, min_similarity=0.2, filter_doc_ids=filter_doc_ids)
+                
+                if context:
+                    print(f"✅ Retrieved {len(citations)} relevant chunks ({len(context)} chars)")
+                    print(f"   Context will be pipelined to LLM")
+                else:
+                    print("⚠️ No relevant context found - LLM will answer without document context")
             else:
-                print("⚠️ No relevant context found")
+                print(f"💬 Conversational message detected - responding naturally without document search")
             
             # Build conversation history
             conversation = []
@@ -1519,79 +1945,413 @@ class RAGEngine:
             # Build prompt
             prompt = f"{system_prompt}\n\n"
             
-            if context:
-                prompt += f"=== RELEVANT DOCUMENT CONTEXT ===\n{context}\n\n"
-                prompt += f"=== INSTRUCTIONS ===\n"
-                prompt += f"You are an intelligent assistant that can analyze, summarize, and draw conclusions from the provided context.\n\n"
-                prompt += f"1. **Base your answer on the context provided above** - Use the information from the documents as your primary source.\n"
-                prompt += f"2. **Analyze and synthesize** - You can:\n"
-                prompt += f"   - Summarize key points from multiple sources\n"
-                prompt += f"   - Draw conclusions and inferences from the data\n"
-                prompt += f"   - Identify patterns, trends, or relationships\n"
-                prompt += f"   - Provide analysis and interpretation\n"
-                prompt += f"   - Make logical deductions based on the information\n"
-                prompt += f"3. **Cite sources** - Use [1], [2], etc. when referencing specific information from the documents.\n"
-                prompt += f"4. **Be analytical** - Don't just quote the text. Provide:\n"
-                prompt += f"   - Clear summaries when asked\n"
-                prompt += f"   - Conclusions based on the evidence\n"
-                prompt += f"   - Insights and interpretations\n"
-                prompt += f"   - Connections between different pieces of information\n"
-                prompt += f"5. **Stay grounded** - All analysis, conclusions, and summaries must be:\n"
-                prompt += f"   - Directly supported by the provided context\n"
-                prompt += f"   - Logically derived from the information given\n"
-                prompt += f"   - Clearly distinguished from general knowledge (cite sources)\n"
-                prompt += f"6. **If context is insufficient** - If the documents don't contain enough information:\n"
-                prompt += f"   - State what information is available\n"
-                prompt += f"   - Explain what conclusions can be drawn from it\n"
-                prompt += f"   - Note any limitations or gaps\n\n"
+            if context and needs_context:
+                print(f"📝 Adding context to LLM prompt ({len(context)} characters)")
+                prompt += f"=== RELEVANT DOCUMENT CONTEXT ===\n"
+                prompt += f"The following information has been retrieved from {len(citations)} document chunks (including expanded context) from the user's documents.\n"
+                prompt += f"**IMPORTANT: Read and analyze the ENTIRE context below before answering.**\n"
+                prompt += f"The context includes both directly relevant chunks and surrounding chunks from the same documents to provide complete context.\n\n"
+                prompt += f"{context}\n\n"
+                prompt += f"=== ANSWERING INSTRUCTIONS ===\n"
+                prompt += f"You are an intelligent assistant. Follow these steps to answer the question:\n\n"
+                prompt += f"**STEP 1: Analyze the COMPLETE context FIRST**\n"
+                prompt += f"1. Read through ALL the document context provided above - do not focus on just one line or chunk.\n"
+                prompt += f"2. Understand the FULL context and how different chunks relate to each other.\n"
+                prompt += f"3. Scan through the entire context to find all relevant information, not just the first matching line.\n"
+                prompt += f"4. Consider the relationships between different parts of the document.\n"
+                prompt += f"5. Make your decision based on the WHOLE context, synthesizing information from multiple chunks.\n\n"
+                prompt += f"**STEP 2: Answer comprehensively from the full context**\n"
+                prompt += f"6. If the context has sufficient information:\n"
+                prompt += f"   - Answer based PRIMARILY on the COMPLETE context provided (not just single lines)\n"
+                prompt += f"   - Cite sources using [1], [2], etc. when referencing specific information\n"
+                prompt += f"   - Synthesize information from MULTIPLE chunks to provide a comprehensive answer\n"
+                prompt += f"   - Draw logical conclusions from the ENTIRE provided context\n"
+                prompt += f"   - If information appears in multiple places, combine and reconcile it\n\n"
+                prompt += f"**STEP 3: If context is insufficient or doesn't answer the question**\n"
+                prompt += f"7. If the context doesn't contain enough information to fully answer the question:\n"
+                prompt += f"   - First, state what information IS available in the context (if any)\n"
+                prompt += f"   - Then, clearly indicate that the answer is not fully available in the provided documents\n"
+                prompt += f"   - Use this format: \"The provided documents don't contain [specific information], but I can tell you from my knowledge that...\"\n"
+                prompt += f"   - Provide your answer using your general knowledge\n"
+                prompt += f"   - Be helpful and comprehensive in your response\n\n"
+                prompt += f"**IMPORTANT GUIDELINES:**\n"
+                prompt += f"- Always prioritize context when it's available and relevant\n"
+                prompt += f"- When using general knowledge, always acknowledge it clearly\n"
+                prompt += f"- If context partially answers the question, use it and supplement with general knowledge if needed\n"
+                prompt += f"- Be transparent about what comes from documents vs. your knowledge\n"
+                prompt += f"- ALWAYS scan through the ENTIRE context, not just the first matching line\n\n"
+            elif needs_context and not context:
+                # Document search was attempted but no context found
+                prompt += f"=== ANSWERING INSTRUCTIONS ===\n"
+                prompt += f"No relevant documents were found in the knowledge base for this question.\n\n"
+                prompt += f"You should:\n"
+                prompt += f"1. Clearly state: \"The provided documents don't contain information about this topic.\"\n"
+                prompt += f"2. Then provide a helpful answer using your general knowledge\n"
+                prompt += f"3. Use this format: \"However, I can tell you from my knowledge that...\"\n"
+                prompt += f"4. Be comprehensive and helpful in your response\n\n"
             else:
+                # Conversational message - respond naturally
                 prompt += f"=== INSTRUCTIONS ===\n"
-                prompt += f"No relevant documents were found in the knowledge base. "
-                prompt += f"You can still provide a helpful answer based on your general knowledge, "
-                prompt += f"but clearly state that no specific documents were referenced.\n\n"
+                prompt += f"This is a conversational message. Respond naturally and helpfully without mentioning documents.\n"
+                prompt += f"Just have a friendly conversation - no need to reference documents or context.\n\n"
             
             if conversation:
                 prompt += f"=== CONVERSATION HISTORY ===\n" + '\n'.join(conversation) + "\n\n"
             
             prompt += f"=== QUESTION ===\n{query}\n\n=== ANSWER ===\n"
             
-            # Call Ollama
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": context_length
-                    }
-                },
-                timeout=120
+            # Calculate required context window size
+            # Estimate tokens: ~4 characters per token, add buffer for safety
+            prompt_tokens = len(prompt) // 4
+            required_ctx = max(prompt_tokens + 1000, context_length)  # Ensure enough space for response
+            
+            print(f"📏 Prompt size: {len(prompt)} chars (~{prompt_tokens} tokens), setting context window to {required_ctx}")
+            if context:
+                print(f"🔍 Prompt preview (first 500 chars): {prompt[:500]}...")
+                print(f"🔍 Prompt contains context: {'RELEVANT DOCUMENT CONTEXT' in prompt}")
+            
+            # Call Ollama with retry logic for model loading errors
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(
+                        f"{self.ollama_url}/api/generate",
+                        json={
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {
+                                "temperature": temperature,
+                                "num_ctx": required_ctx,  # Context window size - CRITICAL for RAG!
+                                "num_predict": min(context_length, 2048)  # Max tokens to generate
+                            }
+                        },
+                        timeout=120
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        answer = result.get('response', 'No response generated')
+                        
+                        # Append citations if available
+                        if citations:
+                            answer += "\n\n=== Sources ===\n"
+                            for citation in citations:
+                                answer += f"{citation['number']}. {citation['source']}"
+                                if citation.get('page'):
+                                    answer += f", page {citation['page']}"
+                                answer += f" (similarity: {citation['similarity']:.3f})\n"
+                        
+                        return answer
+                    else:
+                        error_text = response.text
+                        # Check for model loading errors
+                        if "load" in error_text.lower() and ("EOF" in error_text or "connection" in error_text.lower()):
+                            if attempt < max_retries - 1:
+                                print(f"⚠️ Model loading error detected, attempting to preload model (attempt {attempt + 1}/{max_retries})...")
+                                self._preload_model()
+                                continue  # Retry
+                            else:
+                                return (
+                                    f"Error: Model loading failed. This usually means:\n"
+                                    f"1. The model '{self.model_name}' is not available or corrupted\n"
+                                    f"2. Ollama is having trouble loading the model\n"
+                                    f"3. There's insufficient memory/disk space\n\n"
+                                    f"Try:\n"
+                                    f"- Check if model exists: ollama list\n"
+                                    f"- Restart Ollama: ollama serve\n"
+                                    f"- Re-pull the model: ollama pull {self.model_name}\n"
+                                    f"Original error: {response.status_code} - {error_text}"
+                                )
+                        return f"Error: {response.status_code} - {error_text}"
+                        
+                except requests.exceptions.ConnectionError as e:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Connection error, retrying (attempt {attempt + 1}/{max_retries})...")
+                        import time
+                        time.sleep(1)
+                        continue
+                    else:
+                        raise
+            
+        except requests.exceptions.ConnectionError as e:
+            error_msg = (
+                f"❌ Cannot connect to Ollama.\n\n"
+                f"Please ensure Ollama is running: ollama serve\n"
+                f"Error: {str(e)}"
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get('response', 'No response generated')
-                
-                # Append citations if available
-                if citations:
-                    answer += "\n\n=== Sources ===\n"
-                    for citation in citations:
-                        answer += f"{citation['number']}. {citation['source']}"
-                        if citation.get('page'):
-                            answer += f", page {citation['page']}"
-                        answer += f" (similarity: {citation['similarity']:.3f})\n"
-                
-                return answer
-            else:
-                return f"Error: {response.status_code} - {response.text}"
-            
+            return error_msg
         except Exception as e:
+            error_str = str(e)
+            # Check for EOF/model loading errors in exception message
+            if "load" in error_str.lower() and ("EOF" in error_str or "connection" in error_str.lower()):
+                return (
+                    f"Error: Model loading failed. This usually means:\n"
+                    f"1. The model '{self.model_name}' is not available or corrupted\n"
+                    f"2. Ollama is having trouble loading the model\n"
+                    f"3. There's insufficient memory/disk space\n\n"
+                    f"Try:\n"
+                    f"- Check if model exists: ollama list\n"
+                    f"- Restart Ollama: ollama serve\n"
+                    f"- Re-pull the model: ollama pull {self.model_name}\n"
+                    f"Original error: {error_str}"
+                )
             print(f"❌ Error generating response: {e}")
             import traceback
             traceback.print_exc()
             return f"Error generating response: {str(e)}"
+    
+    async def generate_response_stream(
+        self,
+        message: str,
+        context_length: int,
+        memory_enabled: bool,
+        temperature: float,
+        system_prompt: str,
+        history: List[Dict],
+        top_k: int = 5,
+        filter_doc_ids: Optional[List[str]] = None
+    ):
+        """Generate response with streaming support - yields chunks as they arrive"""
+        try:
+            if not self.is_available():
+                yield "data: " + json.dumps({"chunk": "⚠️ Ollama is not running. Please start it with:\n\n1. Open a terminal\n2. Run: ollama serve\n3. Ensure model is pulled: ollama pull gemma2:2b", "done": True}) + "\n\n"
+                return
+            
+            query = message.strip()
+            if not query:
+                yield "data: " + json.dumps({"chunk": "Please provide a question or query.", "done": True}) + "\n\n"
+                return
+            
+            # Determine if this needs document context
+            needs_context = self._needs_document_context(query, filter_doc_ids)
+            context = ""
+            citations = []
+            
+            if needs_context:
+                # Retrieve context with citations (async)
+                query_lower = query.lower()
+                is_analysis_query = any(word in query_lower for word in ["summar", "conclusion", "analyze", "synthesize", "overview", "key points", "main ideas", "summary"])
+                retrieval_k = top_k * 2 if is_analysis_query else top_k
+                
+                print(f"🔍 Retrieving context for query: '{query[:100]}...'")
+                if filter_doc_ids:
+                    print(f"📄 Filtering to selected documents: {filter_doc_ids}")
+                else:
+                    print(f"📚 Searching all documents in knowledge base")
+                
+                context, citations = await self.retrieve_context(query, top_k=retrieval_k, min_similarity=0.2, filter_doc_ids=filter_doc_ids)
+                
+                if context:
+                    print(f"✅ Retrieved {len(citations)} relevant chunks ({len(context)} chars)")
+                    print(f"   Context will be pipelined to LLM")
+                else:
+                    print("⚠️ No relevant context found - LLM will answer without document context")
+            else:
+                print(f"💬 Conversational message detected - responding naturally without document search")
+            
+            # Build conversation history
+            conversation = []
+            if memory_enabled and len(history) > 1:
+                max_history = min(len(history) - 1, context_length // 512)
+                for msg in history[-max_history:]:
+                    role = msg.get('role', 'user')
+                    content = msg.get('content', '')
+                    if role == 'user':
+                        conversation.append(f"User: {content}")
+                    elif role == 'assistant':
+                        conversation.append(f"Assistant: {content}")
+            
+            # Build prompt
+            prompt = f"{system_prompt}\n\n"
+            
+            if context and needs_context:
+                print(f"📝 Adding context to LLM prompt ({len(context)} characters)")
+                prompt += f"=== RELEVANT DOCUMENT CONTEXT ===\n"
+                prompt += f"The following information has been retrieved from {len(citations)} document chunks from the user's documents.\n\n"
+                prompt += f"{context}\n\n"
+                prompt += f"=== ANSWERING INSTRUCTIONS ===\n"
+                prompt += f"You are an intelligent assistant. Follow these steps to answer the question:\n\n"
+                prompt += f"**STEP 1: Try to answer from context FIRST**\n"
+                prompt += f"1. Carefully read the document context provided above.\n"
+                prompt += f"2. Check if the context contains information that directly answers the question.\n"
+                prompt += f"3. If the context has sufficient information:\n"
+                prompt += f"   - Answer based PRIMARILY on the context provided\n"
+                prompt += f"   - Cite sources using [1], [2], etc. when referencing specific information\n"
+                prompt += f"   - Analyze and synthesize information from multiple chunks if needed\n"
+                prompt += f"   - Draw logical conclusions from the provided context\n\n"
+                prompt += f"**STEP 2: If context is insufficient or doesn't answer the question**\n"
+                prompt += f"4. If the context doesn't contain enough information to fully answer the question:\n"
+                prompt += f"   - First, state what information IS available in the context (if any)\n"
+                prompt += f"   - Then, clearly indicate that the answer is not fully available in the provided documents\n"
+                prompt += f"   - Use this format: \"The provided documents don't contain [specific information], but I can tell you from my knowledge that...\"\n"
+                prompt += f"   - Provide your answer using your general knowledge\n"
+                prompt += f"   - Be helpful and comprehensive in your response\n\n"
+                prompt += f"**IMPORTANT GUIDELINES:**\n"
+                prompt += f"- Always prioritize context when it's available and relevant\n"
+                prompt += f"- When using general knowledge, always acknowledge it clearly\n"
+                prompt += f"- If context partially answers the question, use it and supplement with general knowledge if needed\n"
+                prompt += f"- Be transparent about what comes from documents vs. your knowledge\n\n"
+            elif needs_context and not context:
+                # Document search was attempted but no context found
+                prompt += f"=== ANSWERING INSTRUCTIONS ===\n"
+                prompt += f"No relevant documents were found in the knowledge base for this question.\n\n"
+                prompt += f"You should:\n"
+                prompt += f"1. Clearly state: \"The provided documents don't contain information about this topic.\"\n"
+                prompt += f"2. Then provide a helpful answer using your general knowledge\n"
+                prompt += f"3. Use this format: \"However, I can tell you from my knowledge that...\"\n"
+                prompt += f"4. Be comprehensive and helpful in your response\n\n"
+            else:
+                # Conversational message - respond naturally
+                prompt += f"=== INSTRUCTIONS ===\n"
+                prompt += f"This is a conversational message. Respond naturally and helpfully without mentioning documents.\n"
+                prompt += f"Just have a friendly conversation - no need to reference documents or context.\n\n"
+            
+            if conversation:
+                prompt += f"=== CONVERSATION HISTORY ===\n" + '\n'.join(conversation) + "\n\n"
+            
+            prompt += f"=== QUESTION ===\n{query}\n\n=== ANSWER ===\n"
+            
+            # Calculate required context window size
+            # Estimate tokens: ~4 characters per token, add buffer for safety
+            prompt_tokens = len(prompt) // 4
+            required_ctx = max(prompt_tokens + 1000, context_length)  # Ensure enough space for response
+            
+            print(f"📏 Prompt size: {len(prompt)} chars (~{prompt_tokens} tokens), setting context window to {required_ctx}")
+            if context:
+                print(f"🔍 Prompt preview (first 500 chars): {prompt[:500]}...")
+                print(f"🔍 Prompt contains context: {'RELEVANT DOCUMENT CONTEXT' in prompt}")
+            
+            # Call Ollama with streaming - use queue for real-time streaming
+            import asyncio
+            import threading
+            queue = asyncio.Queue()
+            done_flag = asyncio.Event()
+            loop = asyncio.get_event_loop()
+            
+            def stream_ollama():
+                try:
+                    response = requests.post(
+                        f"{self.ollama_url}/api/generate",
+                        json={
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "stream": True,
+                            "options": {
+                                "temperature": temperature,
+                                "num_ctx": required_ctx,  # Context window size - CRITICAL for RAG!
+                                "num_predict": min(context_length, 2048)  # Max tokens to generate
+                            }
+                        },
+                        stream=True,
+                        timeout=120
+                    )
+                    
+                    if response.status_code == 200:
+                        for line in response.iter_lines(decode_unicode=True):
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    chunk = data.get('response', '')
+                                    if chunk:
+                                        # Put chunk in queue immediately
+                                        asyncio.run_coroutine_threadsafe(
+                                            queue.put(("data: " + json.dumps({"chunk": chunk, "done": False}) + "\n\n")),
+                                            loop
+                                        )
+                                    
+                                    if data.get('done', False):
+                                        if citations:
+                                            citations_text = "\n\n=== Sources ===\n"
+                                            for citation in citations:
+                                                citations_text += f"{citation['number']}. {citation['source']}"
+                                                if citation.get('page'):
+                                                    citations_text += f", page {citation['page']}"
+                                                citations_text += f" (similarity: {citation['similarity']:.3f})\n"
+                                            asyncio.run_coroutine_threadsafe(
+                                                queue.put(("data: " + json.dumps({"chunk": citations_text, "done": True}) + "\n\n")),
+                                                loop
+                                            )
+                                        else:
+                                            asyncio.run_coroutine_threadsafe(
+                                                queue.put(("data: " + json.dumps({"chunk": "", "done": True}) + "\n\n")),
+                                                loop
+                                            )
+                                        loop.call_soon_threadsafe(done_flag.set)
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                    else:
+                        error_text = response.text
+                        # Check for model loading errors
+                        if "load" in error_text.lower() and ("EOF" in error_text or "connection" in error_text.lower()):
+                            error_msg = (
+                                f"Error: Model loading failed. This usually means:\n"
+                                f"1. The model '{self.model_name}' is not available or corrupted\n"
+                                f"2. Ollama is having trouble loading the model\n"
+                                f"3. There's insufficient memory/disk space\n\n"
+                                f"Try:\n"
+                                f"- Check if model exists: ollama list\n"
+                                f"- Restart Ollama: ollama serve\n"
+                                f"- Re-pull the model: ollama pull {self.model_name}\n"
+                                f"Original error: {response.status_code} - {error_text}"
+                            )
+                        else:
+                            error_msg = f"Error: {response.status_code} - {error_text}"
+                        error_chunk = "data: " + json.dumps({"chunk": error_msg, "done": True}) + "\n\n"
+                        asyncio.run_coroutine_threadsafe(queue.put(error_chunk), loop)
+                        loop.call_soon_threadsafe(done_flag.set)
+                except requests.exceptions.ConnectionError as e:
+                    error_msg = (
+                        f"❌ Cannot connect to Ollama.\n\n"
+                        f"Please ensure Ollama is running: ollama serve\n"
+                        f"Error: {str(e)}"
+                    )
+                    error_chunk = "data: " + json.dumps({"chunk": error_msg, "done": True}) + "\n\n"
+                    asyncio.run_coroutine_threadsafe(queue.put(error_chunk), loop)
+                    loop.call_soon_threadsafe(done_flag.set)
+                except Exception as e:
+                    error_str = str(e)
+                    # Check for EOF/model loading errors in exception message
+                    if "load" in error_str.lower() and ("EOF" in error_str or "connection" in error_str.lower()):
+                        error_msg = (
+                            f"Error: Model loading failed. This usually means:\n"
+                            f"1. The model '{self.model_name}' is not available or corrupted\n"
+                            f"2. Ollama is having trouble loading the model\n"
+                            f"3. There's insufficient memory/disk space\n\n"
+                            f"Try:\n"
+                            f"- Check if model exists: ollama list\n"
+                            f"- Restart Ollama: ollama serve\n"
+                            f"- Re-pull the model: ollama pull {self.model_name}\n"
+                            f"Original error: {error_str}"
+                        )
+                    else:
+                        error_msg = f"Error: {str(e)}"
+                    error_chunk = "data: " + json.dumps({"chunk": error_msg, "done": True}) + "\n\n"
+                    asyncio.run_coroutine_threadsafe(queue.put(error_chunk), loop)
+                    loop.call_soon_threadsafe(done_flag.set)
+            
+            # Start streaming in thread
+            thread = threading.Thread(target=stream_ollama, daemon=True)
+            thread.start()
+            
+            # Yield chunks as they arrive
+            while not done_flag.is_set() or not queue.empty():
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    yield chunk
+                    if '"done":true' in chunk:
+                        break
+                except asyncio.TimeoutError:
+                    if done_flag.is_set():
+                        break
+                    continue
+            
+        except Exception as e:
+            print(f"❌ Error generating streaming response: {e}")
+            import traceback
+            traceback.print_exc()
+            yield "data: " + json.dumps({"chunk": f"Error generating response: {str(e)}", "done": True}) + "\n\n"
     
     def is_available(self) -> bool:
         """Check if Ollama is available"""
@@ -1600,3 +2360,120 @@ class RAGEngine:
             return response.status_code == 200
         except:
             return False
+    
+    def _preload_model(self) -> bool:
+        """Preload the model to avoid EOF errors during first request"""
+        try:
+            print(f"🔄 Preloading model {self.model_name}...")
+            # Make a small test request to load the model
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": "test",
+                    "stream": False,
+                    "options": {
+                        "num_predict": 1,  # Just generate 1 token to load the model
+                        "num_ctx": 128
+                    }
+                },
+                timeout=60
+            )
+            if response.status_code == 200:
+                print(f"✅ Model {self.model_name} preloaded successfully")
+                return True
+            else:
+                print(f"⚠️ Model preload returned status {response.status_code}: {response.text}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Model preload failed: {e}")
+            return False
+    
+    def switch_model(self, model_name: str) -> bool:
+        """Switch to a different Ollama model and preload it"""
+        try:
+            # Verify model exists
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                model_names = [m.get('name', '') for m in models]
+                if model_name in model_names:
+                    old_model = self.model_name
+                    self.model_name = model_name
+                    print(f"🔄 Switching RAG model from {old_model} to {model_name}...")
+                    
+                    # Give Ollama a moment to unload the previous model
+                    import time
+                    time.sleep(0.5)
+                    
+                    # Preload the new model to avoid EOF errors on first request
+                    if self._preload_model():
+                        print(f"✅ Switched RAG model to: {model_name} (preloaded)")
+                        return True
+                    else:
+                        print(f"⚠️ Switched RAG model to: {model_name} (preload failed, but will try on first request)")
+                        # Still return True - the model switch succeeded, preload is just optimization
+                        return True
+                else:
+                    print(f"⚠️ Model {model_name} not found. Available models: {model_names}")
+                    return False
+            return False
+        except Exception as e:
+            print(f"❌ Error switching model: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def get_available_models(self) -> List[str]:
+        """Get list of available Ollama models"""
+        try:
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                return [m.get('name', '') for m in models]
+            return []
+        except:
+            return []
+    
+    def download_model(self, model_name: str) -> Dict[str, Any]:
+        """Download an Ollama model"""
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/pull",
+                json={"name": model_name},
+                stream=True,
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                # Stream the download progress
+                progress_data = []
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            progress_data.append(data)
+                            if data.get('status') == 'success':
+                                return {
+                                    'success': True,
+                                    'message': f'Model {model_name} downloaded successfully',
+                                    'progress': progress_data
+                                }
+                        except:
+                            pass
+                
+                return {
+                    'success': True,
+                    'message': f'Model {model_name} download initiated',
+                    'progress': progress_data
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'Failed to download model: {response.status_code}'
+                }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f'Error downloading model: {str(e)}'
+            }

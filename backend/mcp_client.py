@@ -246,3 +246,5 @@ class MCPClient:
         """Get list of available and configured MCP servers"""
         return [name for name, config in self.servers.items() if config["enabled"]]
 
+
+

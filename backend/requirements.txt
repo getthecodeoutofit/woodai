@@ -11,8 +11,10 @@ numpy==1.26.4                    # Core numerical computing (compatible with PyT
 # PyTorch ecosystem (CPU/CUDA compatible)
 torch==2.2.1                     # PyTorch core
 torchvision==0.17.1              # Image processing for PyTorch
-transformers==4.38.2             # Hugging Face transformers (compatible with torch 2.2.x)
-sentence-transformers==2.5.1     # Sentence embeddings and semantic search
+transformers>=4.40.0,<5.0.0       # Hugging Face transformers (compatible with torch 2.2.x, updated to fix resume_download deprecation)
+sentence-transformers>=2.7.0,<4.0.0  # Sentence embeddings and semantic search (updated to fix resume_download deprecation)
+huggingface_hub>=0.20.0,<1.0.0   # Hugging Face Hub (explicit version to avoid deprecated resume_download)
+tf-keras>=2.15.0,<3.0.0          # Keras 2 compatibility layer for transformers (required when TensorFlow is detected)
 
 # --- Web Framework & API ---
 fastapi==0.110.0                 # Modern async web framework
@@ -39,7 +41,7 @@ camelot-py[cv]==0.11.0           # Advanced table extraction from PDFs
 tabula-py==2.9.0                 # Table extraction from PDFs
 
 # Office documents
-python-docx==1.1.0               # Microsoft Word (.docx) processing
+python-docx>=1.1.2               # Microsoft Word (.docx) processing (updated for unstructured compatibility)
 python-pptx==0.6.23              # Microsoft PowerPoint (.pptx) processing
 openpyxl==3.1.2                  # Microsoft Excel (.xlsx) processing
 
@@ -61,13 +63,22 @@ langchain-community==0.0.38      # Community integrations
 langchain-text-splitters==0.0.1  # Advanced text splitting
 langchain-core==0.1.52           # Core LangChain components
 langchain-chroma==0.1.3          # Chroma vector store integration (optional, fallback)
-unstructured[pdf,docx,xlsx,md]==0.12.4  # Advanced document parsing (HTML handled by beautifulsoup4)
+# Unstructured document parsing
+# IMPORTANT: unstructured-inference (auto-installed) requires onnxruntime<1.16
+# but chromadb needs onnxruntime>=1.16. After installing requirements, run:
+#   pip uninstall -y unstructured-inference
+# This removes the inference package (optional) and resolves the conflict.
+# Note: unstructured[docx] requires python-docx>=1.1.2 (we've updated python-docx above)
+unstructured[pdf,docx,xlsx,md]>=0.15.0,<0.19.0  # Advanced document parsing (version range for stability)
 # detectron2             # For advanced document layout detection (optional)
 
 # --- Vector Database ---
-qdrant-client==1.7.0             # Qdrant - Modern, fast vector database (primary)
+# Note: qdrant-client 1.16.1+ uses query_points() instead of search()
+# The code has been updated to support both old and new APIs
+qdrant-client>=1.7.0,<2.0.0      # Qdrant - Modern, fast vector database (primary)
+# Tested with 1.16.1 - uses query_points() API
 chromadb==0.4.22                 # Chroma vector database (optional, fallback)
-onnxruntime==1.16.3             # Required by chromadb for default embeddings (can be avoided with custom embedding function)
+onnxruntime>=1.16.0,<2.0.0     # Required by chromadb for default embeddings (can be avoided with custom embedding function)
 tiktoken==0.7.0                  # Token counting for chunk size management
 
 # --- Web Scraping ---
@@ -114,6 +125,8 @@ opencv-python==4.9.0.80          # Computer vision for image preprocessing
 #
 # 6. Install all dependencies:
 #    pip install -r requirements.txt
+#    # Fix unstructured-inference conflict (optional package conflicts with onnxruntime):
+#    pip uninstall -y unstructured-inference
 #
 # 7. For faster agent mode, httpx is now included for async HTTP requests.
 #
@@ -138,6 +151,12 @@ opencv-python==4.9.0.80          # Computer vision for image preprocessing
 # Recent Updates:
 # ============================================================================
 # - Added httpx==0.27.0 for async HTTP (faster agent mode)
+# - Updated transformers and sentence-transformers to fix resume_download deprecation warning
+# - Added explicit huggingface_hub version to avoid deprecated resume_download parameter
+# - Fixed onnxruntime/unstructured-inference conflict (uninstall unstructured-inference after install)
+# - Fixed TensorFlow/Keras 3 compatibility issue (added tf-keras for transformers compatibility when TensorFlow is detected)
+# - Fixed python-docx version conflict (updated to >=1.1.2 for unstructured compatibility)
+# - Updated unstructured version constraint for better stability
 # - All packages verified and up to date
 # - Compatible with Python 3.11+
 # ============================================================================
