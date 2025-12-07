@@ -4,7 +4,7 @@
 @tailwind utilities;
 /* Then keep all your existing CSS below */
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
@@ -14,6 +14,10 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  
+  /* Apple-style smooth scrolling */
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
 }
 
 * {
@@ -27,14 +31,34 @@ body {
   display: flex;
   place-items: center;
   min-width: 320px;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  min-height: -webkit-fill-available;
+  max-height: 100vh;
+  max-height: 100dvh;
   overflow: hidden;
+  /* Safe area insets for mobile browsers only */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  /* Smooth transitions */
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 #root {
   width: 100%;
   height: 100vh;
+  height: 100dvh; /* Dynamic viewport height */
+  height: -webkit-fill-available;
+  max-height: 100vh;
+  max-height: 100dvh;
   overflow: hidden;
+  /* Account for mobile browser UI only */
+  padding-top: env(safe-area-inset-top, 0px);
+  display: flex;
+  flex-direction: column;
+  position: relative;
 }
 
 button {
@@ -73,4 +97,200 @@ input, textarea {
 
 .dark ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.3);
+}
+
+/* Apple Liquid Glass Effects */
+.glass-effect {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+}
+
+.glass-effect-dark {
+  background: rgba(17, 24, 39, 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+}
+
+/* Smooth animations */
+@keyframes smoothFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes liquidPress {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.95);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.smooth-transition {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.liquid-button {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.liquid-button:active {
+  transform: scale(0.96);
+  animation: liquidPress 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.liquid-button::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  transform: translate(-50%, -50%);
+  transition: width 0.6s, height 0.6s;
+}
+
+.liquid-button:active::before {
+  width: 300px;
+  height: 300px;
+}
+
+/* Mobile-specific glass effects and styling */
+@media (max-width: 768px) {
+  .glass-effect {
+    background: rgba(255, 255, 255, 0.7) !important;
+    backdrop-filter: blur(20px) saturate(180%) !important;
+    -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
+  }
+  
+  .glass-effect-dark {
+    background: rgba(17, 24, 39, 0.7) !important;
+    backdrop-filter: blur(20px) saturate(180%) !important;
+    -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
+  }
+  
+  .liquid-button {
+    box-shadow: 0 4px 16px rgba(217, 119, 6, 0.4) !important;
+  }
+}
+
+/* Desktop - restore original styling */
+@media (min-width: 769px) {
+  .glass-effect {
+    background: rgba(255, 255, 255, 0.4) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+  }
+  
+  .glass-effect-dark {
+    background: rgba(17, 24, 39, 0.4) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+  }
+  
+  .liquid-button {
+    box-shadow: none !important;
+  }
+  
+  /* Ensure proper flex layout on desktop */
+  .flex {
+    display: flex;
+  }
+  
+  /* Prevent overflow issues */
+  .min-w-0 {
+    min-width: 0;
+  }
+  
+  /* Proper scrolling */
+  .overflow-y-auto {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* Mobile optimizations */
+@media (max-width: 768px) {
+  /* Improve touch targets */
+  button, a {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  
+  /* Prevent text selection on buttons */
+  button {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  
+  /* Better scrolling on mobile */
+  * {
+    -webkit-overflow-scrolling: touch;
+    scroll-behavior: smooth;
+  }
+  
+  /* Prevent zoom on input focus (iOS) */
+  input[type="text"],
+  input[type="range"],
+  textarea {
+    font-size: 16px;
+  }
+  
+  /* Ensure header is always on top */
+  header,
+  [class*="header"],
+  [class*="Header"] {
+    position: relative !important;
+    z-index: 9999 !important;
+  }
+  
+  /* Ensure menu button is always visible */
+  button[aria-label="Toggle sidebar"],
+  button[title*="menu"],
+  button[title*="Menu"] {
+    position: relative !important;
+    z-index: 10000 !important;
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+  }
+  
+  /* Add extra padding for mobile browser UI only */
+  #root {
+    padding-top: max(env(safe-area-inset-top, 0px), 30px) !important;
+  }
+  
+  /* Ensure main container accounts for browser UI - mobile only */
+  body {
+    padding-top: max(env(safe-area-inset-top, 0px), 30px) !important;
+  }
+  
+  /* Smooth animations for mobile */
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* Touch-friendly interactions */
+.touch-manipulation {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }

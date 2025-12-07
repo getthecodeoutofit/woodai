@@ -2,7 +2,14 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Menu, Settings, History, MessageSquare, Brain, Workflow, Send, Plus, ChevronLeft, Moon, Sun, Trash2, User, Paperclip, Camera, X, Download, Copy, Check, Volume2, VolumeX, Maximize2, Minimize2, RefreshCw, Zap, FileText, Image as ImageIcon, FolderOpen, Save } from 'lucide-react';
 
 export default function AIChat() {
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Initialize sidebar state based on screen size
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    // Default to closed on mobile, open on desktop
+    if (typeof window !== 'undefined') {
+      return window.innerWidth >= 768;
+    }
+    return true;
+  });
   const [darkMode, setDarkMode] = useState(false);
   const [activeMode, setActiveMode] = useState('rag');
   const [messages, setMessages] = useState([
@@ -16,7 +23,7 @@ export default function AIChat() {
   ]);
   const [activeView, setActiveView] = useState('chat');
   const [contextLength, setContextLength] = useState(4096);
-  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [memoryEnabled] = useState(true);
   const [temperature, setTemperature] = useState(0.7);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
@@ -35,7 +42,7 @@ export default function AIChat() {
   const [currentChatId, setCurrentChatId] = useState(null);
   const [documents, setDocuments] = useState([]);
   const [selectedDocuments, setSelectedDocuments] = useState([]);
-  const [showDocuments, setShowDocuments] = useState(false);
+  const [_showDocuments, _setShowDocuments] = useState(false);
   const [showFileLocationDialog, setShowFileLocationDialog] = useState(false);
   const [pendingMessage, setPendingMessage] = useState(null);
   const [fileLocation, setFileLocation] = useState({ filename: '', directory: 'agent_outputs' });
@@ -45,6 +52,22 @@ export default function AIChat() {
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [downloadingModel, setDownloadingModel] = useState(null);
   const [downloadProgress, setDownloadProgress] = useState('');
+  const [apiBaseUrl] = useState(() => {
+    // API base URL - detect automatically or use environment variable
+    if (import.meta.env.VITE_API_URL) {
+      return import.meta.env.VITE_API_URL;
+    }
+    // Auto-detect: if on mobile/network, use the host's IP, otherwise localhost
+    if (typeof window !== 'undefined') {
+      const hostname = window.location.hostname;
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        return 'http://localhost:8000';
+      }
+      // For mobile devices on same network, use the current host with port 8000
+      return `http://${hostname}:8000`;
+    }
+    return 'http://localhost:8000';
+  });
   
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -60,17 +83,35 @@ export default function AIChat() {
     scrollToBottom();
   }, [messages]);
 
+  // Handle window resize to auto-close sidebar on mobile
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 768) {
+        setSidebarOpen(false);
+      } else {
+        setSidebarOpen(true);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    // Initial check
+    handleResize();
+
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
   // Load chat history from backend
   useEffect(() => {
     loadChatHistory();
     loadDocuments();
     loadModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Load models from backend
   const loadModels = async () => {
     try {
-      const response = await fetch('http://localhost:8000/models');
+      const response = await fetch(`${apiBaseUrl}/models`);
       const data = await response.json();
       
       if (data.rag_model) {
@@ -90,7 +131,7 @@ export default function AIChat() {
   // Switch model
   const switchModel = async (modelName, mode) => {
     try {
-      const response = await fetch('http://localhost:8000/models/switch', {
+      const response = await fetch(`${apiBaseUrl}/models/switch`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -140,7 +181,7 @@ export default function AIChat() {
     setDownloadProgress('Starting download...');
     
     try {
-      const response = await fetch('http://localhost:8000/models/download', {
+      const response = await fetch(`${apiBaseUrl}/models/download`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -267,6 +308,9 @@ export default function AIChat() {
       }
       setIsLoading(true);
 
+      // Store assistantMessageIndex in a ref for use in catch block
+      const assistantIndexRef = { current: undefined };
+
       try {
         // Build file path if provided
         let finalMessage = messageToSend;
@@ -288,11 +332,14 @@ export default function AIChat() {
             timestamp: new Date().toLocaleTimeString()
           }];
         });
+        
+        // Store assistantMessageIndex in ref for use in catch block
+        assistantIndexRef.current = assistantMessageIndex;
 
         // Use streaming endpoint
         // Get updated messages after adding user and assistant messages
         const updatedMessages = [...messages, userMessage];
-        const response = await fetch('http://localhost:8000/chat/stream', {
+        const response = await fetch(`${apiBaseUrl}/chat/stream`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -391,17 +438,18 @@ export default function AIChat() {
         setMessages(prev => {
           const updated = [...prev];
           // Update the assistant message with error
-          if (assistantMessageIndex !== undefined && updated[assistantMessageIndex]) {
-            updated[assistantMessageIndex] = {
+          const assistantIndex = assistantIndexRef?.current;
+          if (assistantIndex !== undefined && updated[assistantIndex]) {
+            updated[assistantIndex] = {
               role: 'assistant',
-              content: 'Sorry, I couldn\'t connect to the server. Please make sure the backend is running on http://localhost:8000',
+              content: `Sorry, I couldn't connect to the server. Please make sure the backend is running on ${apiBaseUrl}`,
               timestamp: new Date().toLocaleTimeString()
             };
           } else {
             // Fallback: add error message
             updated.push({
               role: 'assistant',
-              content: 'Sorry, I couldn\'t connect to the server. Please make sure the backend is running on http://localhost:8000',
+              content: `Sorry, I couldn't connect to the server. Please make sure the backend is running on ${apiBaseUrl}`,
               timestamp: new Date().toLocaleTimeString()
             });
           }
@@ -543,7 +591,7 @@ export default function AIChat() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('http://localhost:8000/chat', {
+      const response = await fetch(`${apiBaseUrl}/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -566,7 +614,7 @@ export default function AIChat() {
         content: data.response,
         timestamp: new Date().toLocaleTimeString()
       }]);
-    } catch (error) {
+    } catch {
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: 'Failed to regenerate response.',
@@ -580,7 +628,7 @@ export default function AIChat() {
   // Load chat history from backend
   const loadChatHistory = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/chats/${userId}`);
+      const response = await fetch(`${apiBaseUrl}/chats/${userId}`);
       const data = await response.json();
       
       if (data.chats) {
@@ -600,7 +648,7 @@ export default function AIChat() {
   // Load specific chat when clicked
   const loadChat = async (chatId) => {
     try {
-      const response = await fetch(`http://localhost:8000/chat/${chatId}`);
+      const response = await fetch(`${apiBaseUrl}/chat/${chatId}`);
       const chat = await response.json();
       
       if (chat && chat.messages) {
@@ -635,7 +683,7 @@ export default function AIChat() {
     if (!confirm('Delete this chat?')) return;
     
     try {
-      const response = await fetch(`http://localhost:8000/chat/${chatId}`, {
+      const response = await fetch(`${apiBaseUrl}/chat/${chatId}`, {
         method: 'DELETE'
       });
       
@@ -655,7 +703,7 @@ export default function AIChat() {
   // Load documents from backend
   const loadDocuments = async () => {
     try {
-      const response = await fetch('http://localhost:8000/documents');
+      const response = await fetch(`${apiBaseUrl}/documents`);
       const data = await response.json();
       
       if (data.documents) {
@@ -676,7 +724,7 @@ export default function AIChat() {
       formData.append('file', file);
       formData.append('user_id', userId);
       
-      const response = await fetch('http://localhost:8000/upload', {
+      const response = await fetch(`${apiBaseUrl}/upload`, {
         method: 'POST',
         body: formData
       });
@@ -714,7 +762,7 @@ export default function AIChat() {
     }
     
     try {
-      const response = await fetch(`http://localhost:8000/document/${docId}`, {
+      const response = await fetch(`${apiBaseUrl}/document/${docId}`, {
         method: 'DELETE'
       });
       
@@ -763,15 +811,38 @@ export default function AIChat() {
   return (
     <div 
       ref={chatContainerRef}
-      className={`flex h-screen ${darkMode ? 'bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900' : 'bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100'} overflow-hidden transition-all duration-500`}
+      className={`flex ${darkMode ? 'bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900' : 'bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100'} overflow-hidden transition-all duration-500`}
+      style={{
+        height: '100dvh', // Dynamic viewport height for better mobile support
+        minHeight: '-webkit-fill-available',
+        maxHeight: '100dvh',
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+      }}
     >
+      
+      {/* Mobile overlay */}
+      {sidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-black/50 z-30 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
       
       {/* Sidebar */}
       <div 
-        className={`${sidebarOpen ? 'w-80' : 'w-0'} transition-all duration-300 ${darkMode ? 'bg-gray-800/40' : 'bg-gradient-to-b from-amber-900/20 to-orange-900/30'} backdrop-blur-xl border-r ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} overflow-hidden`}
+        className={`${
+          sidebarOpen 
+            ? 'w-80 md:w-80 translate-x-0' 
+            : 'w-0 -translate-x-full md:translate-x-0'
+        } fixed md:relative z-40 md:z-auto transition-all duration-300 ${darkMode ? 'glass-effect-dark md:bg-gray-800/40' : 'glass-effect md:bg-gradient-to-b md:from-amber-900/20 md:to-orange-900/30'} border-r ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} overflow-hidden rounded-r-3xl md:rounded-none flex-shrink-0`}
         style={{
-          boxShadow: sidebarOpen ? '4px 0 20px rgba(0,0,0,0.1)' : 'none'
+          boxShadow: sidebarOpen ? '4px 0 20px rgba(0,0,0,0.1)' : 'none',
+          height: '100%',
+          maxHeight: '100dvh'
         }}
+        aria-hidden={!sidebarOpen}
       >
         <div className="h-full flex flex-col p-4 overflow-y-auto">
           {/* Logo & New Chat */}
@@ -868,19 +939,23 @@ export default function AIChat() {
 
           {/* Chat History */}
           {activeView === 'history' && (
-            <div className="flex-1 overflow-y-auto">
-              <div className="mb-3">
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+              {/* Sticky Search Bar */}
+              <div className="flex-shrink-0 mb-3 sticky top-0 z-10 bg-inherit pb-2">
                 <input
                   type="text"
                   placeholder="Search chats..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className={`w-full px-3 py-2 rounded-lg ${darkMode ? 'bg-gray-700/40 text-gray-200 placeholder-gray-400' : 'bg-white/40 text-amber-900 placeholder-amber-700/50'} backdrop-blur-sm border ${darkMode ? 'border-gray-600/30' : 'border-amber-800/10'} outline-none`}
+                  className={`w-full px-3 py-2 rounded-lg ${darkMode ? 'bg-gray-700/40 text-gray-200 placeholder-gray-400' : 'bg-white/40 text-amber-900 placeholder-amber-700/50'} backdrop-blur-sm border ${darkMode ? 'border-gray-600/30' : 'border-amber-800/10'} outline-none focus:ring-2 ${darkMode ? 'focus:ring-amber-500/50' : 'focus:ring-amber-500/30'} transition-all`}
                 />
               </div>
-              <p className={`text-xs font-semibold ${darkMode ? 'text-gray-400' : 'text-amber-800'} mb-3 uppercase tracking-wider`}>Recent Chats</p>
-              <div className="space-y-2">
-                {filteredHistory.map(chat => (
+              
+              {/* Scrollable Chat List */}
+              <div className="flex-1 overflow-y-auto min-h-0">
+                <p className={`text-xs font-semibold ${darkMode ? 'text-gray-400' : 'text-amber-800'} mb-3 uppercase tracking-wider sticky top-0 ${darkMode ? 'bg-gray-800/95' : 'bg-amber-50/95'} backdrop-blur-sm py-1 z-10`}>Recent Chats</p>
+                <div className="space-y-2">
+                  {filteredHistory.map(chat => (
                   <div
                     key={chat.id}
                     onClick={() => loadChat(chat.id)}
@@ -905,7 +980,8 @@ export default function AIChat() {
                       <Trash2 size={14} />
                     </button>
                   </div>
-                ))}
+                  ))}
+                </div>
               </div>
             </div>
           )}
@@ -999,10 +1075,10 @@ export default function AIChat() {
               </div>
 
               {/* Context Length */}
-              <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm`}>
+              <div className={`p-3 md:p-4 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm`}>
                 <div className="flex items-center justify-between mb-3">
                   <span className={`text-sm font-medium ${darkMode ? 'text-gray-200' : 'text-amber-900'}`}>Context Length</span>
-                  <span className={`text-xs ${darkMode ? 'text-amber-400' : 'text-amber-600'} font-semibold`}>{contextLength}</span>
+                  <span className={`text-xs md:text-sm ${darkMode ? 'text-amber-400' : 'text-amber-600'} font-semibold`}>{contextLength.toLocaleString()}</span>
                 </div>
                 <input 
                   type="range" 
@@ -1011,24 +1087,28 @@ export default function AIChat() {
                   step="1024"
                   value={contextLength}
                   onChange={(e) => setContextLength(parseInt(e.target.value))}
-                  className="w-full h-2 rounded-lg appearance-none cursor-pointer"
+                  className="w-full h-3 md:h-2 rounded-lg appearance-none cursor-pointer touch-manipulation slider-mobile"
                   style={{
                     background: darkMode 
                       ? `linear-gradient(to right, #f59e0b ${(contextLength - 1024) / 7168 * 100}%, #374151 ${(contextLength - 1024) / 7168 * 100}%)`
                       : `linear-gradient(to right, #92400e ${(contextLength - 1024) / 7168 * 100}%, #fed7aa ${(contextLength - 1024) / 7168 * 100}%)`
                   }}
+                  aria-label="Context length slider"
                 />
                 <div className="flex justify-between mt-2">
                   <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>1K</span>
                   <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>8K</span>
                 </div>
+                <p className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-amber-600/70'}`}>
+                  Controls how much context the model can use
+                </p>
               </div>
 
               {/* Temperature */}
-              <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm`}>
+              <div className={`p-3 md:p-4 rounded-lg ${darkMode ? 'bg-gray-700/40' : 'bg-white/40'} backdrop-blur-sm`}>
                 <div className="flex items-center justify-between mb-3">
                   <span className={`text-sm font-medium ${darkMode ? 'text-gray-200' : 'text-amber-900'}`}>Temperature</span>
-                  <span className={`text-xs ${darkMode ? 'text-amber-400' : 'text-amber-600'} font-semibold`}>{temperature.toFixed(1)}</span>
+                  <span className={`text-xs md:text-sm ${darkMode ? 'text-amber-400' : 'text-amber-600'} font-semibold`}>{temperature.toFixed(1)}</span>
                 </div>
                 <input 
                   type="range" 
@@ -1037,17 +1117,21 @@ export default function AIChat() {
                   step="0.1"
                   value={temperature}
                   onChange={(e) => setTemperature(parseFloat(e.target.value))}
-                  className="w-full h-2 rounded-lg appearance-none cursor-pointer"
+                  className="w-full h-3 md:h-2 rounded-lg appearance-none cursor-pointer touch-manipulation slider-mobile"
                   style={{
                     background: darkMode 
                       ? `linear-gradient(to right, #f59e0b ${temperature / 2 * 100}%, #374151 ${temperature / 2 * 100}%)`
                       : `linear-gradient(to right, #92400e ${temperature / 2 * 100}%, #fed7aa ${temperature / 2 * 100}%)`
                   }}
+                  aria-label="Temperature slider"
                 />
                 <div className="flex justify-between mt-2">
-                  <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>Precise</span>
-                  <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>Creative</span>
+                  <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>Concise</span>
+                  <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>Very Detailed</span>
                 </div>
+                <p className={`text-xs mt-1 ${darkMode ? 'text-gray-500' : 'text-amber-600/70'}`}>
+                  Lower = concise, Higher = very detailed responses
+                </p>
               </div>
 
               {/* Memory Control */}
@@ -1132,31 +1216,63 @@ export default function AIChat() {
       </div>
 
       {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col">
-        {/* Header */}
-        <div className={`${darkMode ? 'bg-gray-800/40' : 'bg-white/40'} backdrop-blur-xl border-b ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} p-4 flex items-center gap-4`}>
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
+        {/* Header - Sticky on Mobile, Normal on Desktop */}
+        <div 
+          className={`${darkMode ? 'bg-gray-800/40' : 'bg-white/40'} backdrop-blur-xl border-b ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} flex items-center gap-2 md:gap-4 z-50 rounded-b-3xl md:rounded-none sticky md:static md:p-4`}
+          style={{
+            top: 'env(safe-area-inset-top, 0px)',
+            paddingTop: `calc(env(safe-area-inset-top, 0px) + 0.75rem)`,
+            paddingBottom: `calc(env(safe-area-inset-bottom, 0px) + 0.75rem)`,
+            paddingLeft: '0.75rem',
+            paddingRight: '0.75rem'
+          }}
+        >
+          {/* Menu Button */}
           <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className={`p-2 rounded-lg ${darkMode ? 'bg-gray-700/60 hover:bg-gray-700/80 text-amber-400' : 'bg-amber-900/10 hover:bg-amber-900/20 text-amber-900'} transition-all duration-200`}
+            onClick={(e) => {
+              e.stopPropagation();
+              setSidebarOpen(!sidebarOpen);
+            }}
+            className={`liquid-button md:p-2 p-3.5 rounded-2xl md:rounded-lg ${darkMode ? 'bg-amber-600/50 hover:bg-amber-600/60 md:bg-gray-700/60 md:hover:bg-gray-700/80 text-amber-200 md:text-amber-400' : 'bg-amber-600 hover:bg-amber-700 md:bg-amber-900/10 md:hover:bg-amber-900/20 text-white md:text-amber-900'} touch-manipulation shadow-xl md:shadow-none flex-shrink-0 relative z-[100] flex items-center justify-center backdrop-blur-md md:backdrop-blur-sm min-w-[48px] md:min-w-0 min-h-[48px] md:min-h-0 transition-all duration-200`}
+            aria-label="Toggle sidebar"
+            title={sidebarOpen ? 'Close menu' : 'Open menu'}
           >
-            {sidebarOpen ? <ChevronLeft size={20} /> : <Menu size={20} />}
+            {sidebarOpen ? <ChevronLeft size={22} className="md:w-5 md:h-5" /> : <Menu size={22} className="md:w-5 md:h-5" />}
+            {!sidebarOpen && (
+              <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-pulse md:hidden shadow-lg" style={{ boxShadow: '0 0 8px rgba(239, 68, 68, 0.6)' }} />
+            )}
           </button>
           
-          <div className="flex-1">
-            <h2 className={`text-lg font-bold ${darkMode ? 'text-amber-400' : 'text-amber-900'}`}>
-              {activeMode === 'rag' ? 'RAG Assistant' : 'Agent Assistant'}
-            </h2>
-            <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
-              {activeMode === 'rag' 
-                ? `Model: ${currentRagModel} • Context: ${contextLength} • Tokens: ${tokenCount.total}` 
-                : `Model: ${currentAgentModel} • Tool Enhanced • Multi-capability`}
-            </p>
+          {/* Product Name and Mode Info */}
+          <div className="flex-1 min-w-0 flex flex-col">
+            {/* Product Name - Visible on Mobile */}
+            <div className="flex items-center gap-2 md:hidden">
+              <h1 className={`text-lg font-bold ${darkMode ? 'text-amber-400' : 'text-amber-900'} truncate`}>
+                WoodAI
+              </h1>
+              <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-amber-600/30 text-amber-300' : 'bg-amber-600/20 text-amber-800'}`}>
+                {activeMode === 'rag' ? 'RAG' : 'Agent'}
+              </span>
+            </div>
+            
+            {/* Desktop Title */}
+            <div className="hidden md:block">
+              <h2 className={`text-lg font-bold ${darkMode ? 'text-amber-400' : 'text-amber-900'}`}>
+                {activeMode === 'rag' ? 'RAG Assistant' : 'Agent Assistant'}
+              </h2>
+              <p className={`text-sm ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
+                {activeMode === 'rag' 
+                  ? `Model: ${currentRagModel} • Context: ${contextLength} • Tokens: ${tokenCount.total}` 
+                  : `Model: ${currentAgentModel} • Tool Enhanced`}
+              </p>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 md:gap-2 flex-shrink-0">
             <button 
               onClick={toggleFullscreen}
-              className={`p-2 rounded-lg ${darkMode ? 'bg-gray-700/60 hover:bg-gray-700/80 text-gray-400' : 'bg-white/60 hover:bg-white/80 text-amber-900'} transition-all duration-200`}
+              className={`p-2 rounded-lg ${darkMode ? 'bg-gray-700/60 hover:bg-gray-700/80 text-gray-400' : 'bg-white/60 hover:bg-white/80 text-amber-900'} transition-all duration-200 touch-manipulation hidden md:flex`}
               title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
             >
               {isFullscreen ? <Minimize2 size={20} /> : <Maximize2 size={20} />}
@@ -1164,7 +1280,7 @@ export default function AIChat() {
             
             <button 
               onClick={handleNewChat}
-              className={`p-2 rounded-lg ${darkMode ? 'bg-gray-700/60 hover:bg-gray-700/80 text-gray-400' : 'bg-white/60 hover:bg-white/80 text-amber-900'} transition-all duration-200`}
+              className={`p-2.5 md:p-2 rounded-2xl md:rounded-lg ${darkMode ? 'bg-gray-700/50 hover:bg-gray-700/70 md:bg-gray-700/60 md:hover:bg-gray-700/80 text-gray-300 md:text-gray-400' : 'bg-white/70 hover:bg-white/90 md:bg-white/60 md:hover:bg-white/80 text-amber-900'} touch-manipulation backdrop-blur-md md:backdrop-blur-sm min-w-[44px] md:min-w-0 min-h-[44px] md:min-h-0 transition-all duration-200`}
               title="New chat"
             >
               <Trash2 size={20} />
@@ -1191,25 +1307,25 @@ export default function AIChat() {
         )}
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+        <div className="flex-1 overflow-y-auto p-3 md:p-6 space-y-3 md:space-y-4 min-h-0 max-h-full">
           {messages.map((msg, idx) => (
             <div
               key={idx}
-              className={`flex gap-3 animate-[fadeIn_0.3s_ease-in] ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              className={`flex gap-2 md:gap-3 animate-[fadeIn_0.3s_ease-in] ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               {msg.role === 'assistant' && (
-                <div className={`w-10 h-10 rounded-xl ${darkMode ? 'bg-amber-600/30' : 'bg-amber-600/80'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
-                  <Brain className={darkMode ? 'text-amber-400' : 'text-white'} size={20} />
+                <div className={`w-8 h-8 md:w-10 md:h-10 rounded-xl ${darkMode ? 'bg-amber-600/30' : 'bg-amber-600/80'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
+                  <Brain className={darkMode ? 'text-amber-400' : 'text-white'} size={16} />
                 </div>
               )}
               
-              <div className="flex flex-col gap-2 max-w-2xl">
+              <div className="flex flex-col gap-1 md:gap-2 max-w-[85%] md:max-w-2xl">
                 <div
-                  className={`p-4 rounded-2xl ${
+                  className={`p-3 md:p-4 rounded-2xl md:rounded-2xl text-sm md:text-base transition-all duration-200 ${
                     msg.role === 'user'
                       ? darkMode ? 'bg-amber-600/30 text-amber-100' : 'bg-amber-600/80 text-white'
                       : darkMode ? 'bg-gray-700/60 text-gray-100' : 'bg-white/60 text-amber-900'
-                  } backdrop-blur-sm shadow-lg transition-all duration-200 hover:shadow-xl group relative`}
+                  } backdrop-blur-sm shadow-lg hover:shadow-xl group relative break-words`}
                 >
                   {msg.files && msg.files.length > 0 && (
                     <div className="mb-2 flex flex-wrap gap-2">
@@ -1265,8 +1381,8 @@ export default function AIChat() {
               </div>
 
               {msg.role === 'user' && (
-                <div className={`w-10 h-10 rounded-xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
-                  <User className={darkMode ? 'text-amber-400' : 'text-amber-900'} size={20} />
+                <div className={`w-8 h-8 md:w-10 md:h-10 rounded-xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} flex items-center justify-center flex-shrink-0 shadow-lg`}>
+                  <User className={darkMode ? 'text-amber-400' : 'text-amber-900'} size={16} />
                 </div>
               )}
             </div>
@@ -1333,19 +1449,19 @@ export default function AIChat() {
         </div>
 
         {/* Input Area */}
-        <div className={`${darkMode ? 'bg-gray-800/40' : 'bg-white/40'} backdrop-blur-xl border-t ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} p-4`}>
+        <div className={`${darkMode ? 'bg-gray-800/40' : 'bg-white/40'} backdrop-blur-xl border-t ${darkMode ? 'border-gray-700/50' : 'border-amber-800/20'} p-3 md:p-4 flex-shrink-0`}>
           {/* Attached Files */}
           {attachedFiles.length > 0 && (
-            <div className="mb-3 flex flex-wrap gap-2">
+            <div className="mb-2 md:mb-3 flex flex-wrap gap-2">
               {attachedFiles.map((file, idx) => (
-                <div key={idx} className={`flex items-center gap-2 px-3 py-2 rounded-lg ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm`}>
-                  {file.type === 'image' ? <Camera size={16} /> : <Paperclip size={16} />}
-                  <div className="flex flex-col">
-                    <span className={`text-sm ${darkMode ? 'text-gray-200' : 'text-amber-900'}`}>{file.name}</span>
+                <div key={idx} className={`flex items-center gap-2 px-2 md:px-3 py-1.5 md:py-2 rounded-lg ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm text-xs md:text-sm`}>
+                  {file.type === 'image' ? <Camera size={14} /> : <Paperclip size={14} />}
+                  <div className="flex flex-col min-w-0">
+                    <span className={`${darkMode ? 'text-gray-200' : 'text-amber-900'} truncate max-w-[120px] md:max-w-none`}>{file.name}</span>
                     <span className={`text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>{file.size}</span>
                   </div>
-                  <button onClick={() => removeFile(idx)} className={`${darkMode ? 'text-gray-400 hover:text-gray-200' : 'text-amber-700 hover:text-amber-900'}`}>
-                    <X size={16} />
+                  <button onClick={() => removeFile(idx)} className={`${darkMode ? 'text-gray-400 hover:text-gray-200' : 'text-amber-700 hover:text-amber-900'} touch-manipulation`}>
+                    <X size={14} />
                   </button>
                 </div>
               ))}
@@ -1353,19 +1469,19 @@ export default function AIChat() {
           )}
 
           {/* Token Counter */}
-          <div className={`mb-2 flex items-center justify-between text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'}`}>
-            <div className="flex items-center gap-4">
-              <span>Input: {tokenCount.input} tokens</span>
-              <span>Output: {tokenCount.output} tokens</span>
-              <span className="font-semibold">Total: {tokenCount.total}</span>
+          <div className={`mb-2 flex items-center justify-between text-xs ${darkMode ? 'text-gray-400' : 'text-amber-700'} flex-wrap gap-1`}>
+            <div className="flex items-center gap-2 md:gap-4 flex-wrap">
+              <span className="whitespace-nowrap">Input: {tokenCount.input}</span>
+              <span className="whitespace-nowrap">Output: {tokenCount.output}</span>
+              <span className="font-semibold whitespace-nowrap">Total: {tokenCount.total}</span>
             </div>
             <div className="flex items-center gap-2">
-              <Zap size={14} />
+              <Zap size={12} />
               <span>{activeMode === 'rag' ? 'RAG' : 'Agent'}</span>
             </div>
           </div>
 
-          <div className={`flex gap-3 p-2 rounded-2xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm shadow-lg relative`}>
+          <div className={`flex gap-2 md:gap-3 p-2 md:p-2 rounded-xl md:rounded-2xl ${darkMode ? 'bg-gray-700/60' : 'bg-white/60'} backdrop-blur-sm shadow-lg relative w-full`}>
             {/* Attachment Menu */}
             {showAttachMenu && (
               <div className={`absolute bottom-full left-0 mb-2 p-2 rounded-xl ${darkMode ? 'bg-gray-700/90' : 'bg-white/90'} backdrop-blur-xl shadow-xl z-10`}>
@@ -1388,32 +1504,52 @@ export default function AIChat() {
 
             <button
               onClick={() => setShowAttachMenu(!showAttachMenu)}
-              className={`p-3 rounded-xl ${darkMode ? 'hover:bg-gray-600/40 text-amber-400' : 'hover:bg-amber-50 text-amber-900'} transition-all duration-200`}
+              className={`liquid-button md:p-3 p-3 rounded-2xl md:rounded-xl ${darkMode ? 'hover:bg-gray-600/40 text-amber-400' : 'hover:bg-amber-50 text-amber-900'} touch-manipulation min-w-[44px] md:min-w-0 min-h-[44px] md:min-h-0`}
+              aria-label="Attach file"
             >
-              <Paperclip size={20} />
+              <Paperclip size={18} />
             </button>
 
-            <input
-              type="text"
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && !isLoading && !e.shiftKey && handleSend()}
-              placeholder="Type your message... (Shift+Enter for new line)"
-              className={`flex-1 px-4 py-3 bg-transparent outline-none ${darkMode ? 'text-gray-100 placeholder-gray-400' : 'text-amber-900 placeholder-amber-700/50'}`}
-              disabled={isLoading}
-            />
-            
-            <button
-              onClick={handleSend}
-              disabled={isLoading || (!inputValue.trim() && attachedFiles.length === 0)}
-              className={`px-6 py-3 rounded-xl ${
-                isLoading || (!inputValue.trim() && attachedFiles.length === 0)
-                  ? darkMode ? 'bg-gray-600/40 text-gray-500' : 'bg-amber-400/40 text-amber-700'
-                  : darkMode ? 'bg-amber-600/30 hover:bg-amber-600/40 text-amber-400' : 'bg-amber-600/80 hover:bg-amber-600/90 text-white'
-              } transition-all duration-200 font-medium flex items-center gap-2 shadow-lg hover:shadow-xl disabled:cursor-not-allowed`}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!isLoading && (inputValue.trim() || attachedFiles.length > 0)) {
+                  handleSend();
+                }
+              }}
+              className="flex-1 flex gap-2 md:gap-3"
             >
-              <Send size={20} />
-            </button>
+              <input
+                type="text"
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
+                    e.preventDefault();
+                    if (inputValue.trim() || attachedFiles.length > 0) {
+                      handleSend();
+                    }
+                  }
+                }}
+                placeholder="Type your message..."
+                className={`flex-1 px-3 md:px-4 py-2 md:py-3 bg-transparent outline-none text-sm md:text-base ${darkMode ? 'text-gray-100 placeholder-gray-400' : 'text-amber-900 placeholder-amber-700/50'}`}
+                disabled={isLoading}
+                autoComplete="off"
+              />
+              
+              <button
+                type="submit"
+                disabled={isLoading || (!inputValue.trim() && attachedFiles.length === 0)}
+                className={`liquid-button md:px-6 px-5 md:py-3 py-2.5 rounded-2xl md:rounded-xl ${
+                  isLoading || (!inputValue.trim() && attachedFiles.length === 0)
+                    ? darkMode ? 'bg-gray-600/40 text-gray-500' : 'bg-amber-400/40 text-amber-700'
+                    : darkMode ? 'bg-amber-600/50 active:bg-amber-600/70 md:bg-amber-600/30 md:hover:bg-amber-600/40 text-amber-200 md:text-amber-400' : 'bg-amber-600 active:bg-amber-700 md:bg-amber-600/80 md:hover:bg-amber-600/90 text-white'
+                } font-medium flex items-center justify-center gap-2 shadow-xl md:shadow-lg disabled:cursor-not-allowed touch-manipulation backdrop-blur-md md:backdrop-blur-sm transition-all duration-200 min-w-[48px] md:min-w-0 min-h-[48px] md:min-h-0`}
+                aria-label="Send message"
+              >
+                <Send size={18} />
+              </button>
+            </form>
           </div>
         </div>
       </div>
@@ -1744,21 +1880,78 @@ export default function AIChat() {
           }
         }
         
+        /* Mobile-optimized sliders */
+        input[type="range"] {
+          -webkit-appearance: none;
+          appearance: none;
+          touch-action: pan-x;
+        }
+        
         input[type="range"]::-webkit-slider-thumb {
           -webkit-appearance: none;
           appearance: none;
-          width: 18px;
-          height: 18px;
+          width: 24px;
+          height: 24px;
           border-radius: 50%;
           background: #d97706;
           cursor: pointer;
           box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
           transition: all 0.2s ease;
+          border: 2px solid white;
         }
         
-        input[type="range"]::-webkit-slider-thumb:hover {
-          transform: scale(1.1);
-          box-shadow: 0 4px 12px rgba(217, 119, 6, 0.4);
+        @media (min-width: 768px) {
+          input[type="range"]::-webkit-slider-thumb {
+            width: 18px;
+            height: 18px;
+          }
+        }
+        
+        input[type="range"]::-webkit-slider-thumb:hover,
+        input[type="range"]::-webkit-slider-thumb:active {
+          transform: scale(1.15);
+          box-shadow: 0 4px 12px rgba(217, 119, 6, 0.5);
+        }
+        
+        input[type="range"]::-moz-range-thumb {
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #d97706;
+          cursor: pointer;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+          transition: all 0.2s ease;
+          border: 2px solid white;
+        }
+        
+        @media (min-width: 768px) {
+          input[type="range"]::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+          }
+        }
+        
+        input[type="range"]::-moz-range-thumb:hover,
+        input[type="range"]::-moz-range-thumb:active {
+          transform: scale(1.15);
+          box-shadow: 0 4px 12px rgba(217, 119, 6, 0.5);
+        }
+        
+        /* Touch-friendly buttons */
+        .touch-manipulation {
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
+        }
+        
+        /* Mobile sidebar improvements */
+        @media (max-width: 767px) {
+          .sidebar-mobile {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            z-index: 50;
+          }
         }
       `}</style>
     </div>
